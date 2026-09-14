@@ -1,0 +1,9 @@
+# V0.1 本地控制层依赖。版本按当前已验证通过的运行环境锁定。
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+pydantic==2.10.3
+pydantic-settings==2.14.2
+
+# 测试
+pytest==8.4.2
