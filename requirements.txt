@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # V0.1 本地控制层依赖。版本按当前已验证通过的运行环境锁定。
 fastapi==0.115.6
 uvicorn[standard]==0.34.0

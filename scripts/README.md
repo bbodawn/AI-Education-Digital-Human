@@ -21,9 +21,9 @@
 
 也可以在终端里用：
 
-```bash
-python scripts/launcher.py start
-python scripts/launcher.py stop
+```powershell
+.venv\Scripts\python.exe scripts\launcher.py start
+.venv\Scripts\python.exe scripts\launcher.py stop
 ```
 
 > `scripts/launcher.py` 同时承担「常驻的 SSH 端口转发进程」这一内部角色，
@@ -72,10 +72,22 @@ AUTODL_PASSWORD=你的实例密码
 > ⚠️ 这个文件**绝不能**放进项目目录，更不能提交到 Git。
 > AutoDL 的 SSH 地址和端口**每次重建实例都会变**，换实例后需要更新这里。
 
-**2. 本地依赖**
+**2. 本地 Python 环境（首次运行）**
 
-```bash
-pip install -r requirements.txt
+在项目根目录执行：
+
+```powershell
+D:\Anaconda3_2024\Anaconda3\python.exe -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+此后日常启动只需双击 `scripts\start.bat`。启动器固定使用项目的
+`.venv\Scripts\python.exe`；若 `.venv` 不存在，会明确报错，不会回退到 PATH 中的 Python。
+
+运行测试：
+
+```powershell
+.venv\Scripts\python.exe -m pytest -q
 ```
 
 **3. 本地模型**

@@ -8,16 +8,17 @@ chcp 65001 >nul
 set PYTHONIOENCODING=utf-8
 cd /d "%~dp0.."
 
-where python >nul 2>nul
-if errorlevel 1 (
+set "PROJECT_PYTHON=%~dp0..\.venv\Scripts\python.exe"
+if not exist "%PROJECT_PYTHON%" (
   echo.
-  echo [ERROR] Python not found in PATH.
+  echo [ERROR] Project virtual environment not found.
+  echo         Please create and install .venv first.
   echo.
   pause
   exit /b 1
 )
 
-python "%~dp0launcher.py" stop
+"%PROJECT_PYTHON%" "%~dp0launcher.py" stop
 
 echo.
 echo Press any key to close this window...
