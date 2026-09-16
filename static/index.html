@@ -168,13 +168,21 @@
 
     #sendButton:hover { background: #1d4ed8; }
 
+    #recordButton,
     #interruptButton {
       background: #fff;
       color: var(--text);
       border-color: var(--border);
     }
 
+    #recordButton:hover,
     #interruptButton:hover { background: #f7f9fb; }
+
+    #recordButton[data-state="recording"] {
+      background: #fdeded;
+      color: #b42318;
+      border-color: #f7cfcd;
+    }
 
     button:disabled { opacity: 0.5; cursor: not-allowed; }
 
@@ -287,11 +295,12 @@
         <textarea id="messageInput" placeholder="什么是 RAG？"></textarea>
 
         <div class="actions">
+          <button id="recordButton" type="button" data-state="idle">🎤 开始录音</button>
           <button id="askButton" type="button">让数字人回答</button>
           <button id="interruptButton" type="button">打断</button>
         </div>
 
-        <p class="hint" id="hint"></p>
+        <p class="hint" id="hint" role="status" aria-live="polite"></p>
 
         <div class="answer" id="answerBox" hidden>
           <div class="answer-label">数字人回答</div>
@@ -307,6 +316,7 @@
         <li><span class="method">POST</span><code>/api/v1/chat/ask</code></li>
         <li><span class="method">POST</span><code>/api/v1/chat/say</code></li>
         <li><span class="method">POST</span><code>/api/v1/chat/interrupt</code></li>
+        <li><span class="method">POST</span><code>/api/v1/asr/transcribe</code></li>
       </ul>
       <p class="note">
         问题在本地由 Qwen 生成回答，回答文本再转发到 AutoDL 的 LiveTalking，
@@ -324,8 +334,24 @@
      * ------------------------------------------------------------------ */
     const API = {
       ask:       { path: "/api/v1/chat/ask" },
-      interrupt: { path: "/api/v1/chat/interrupt" }
+      interrupt: { path: "/api/v1/chat/interrupt" },
+      asr:       { path: "/api/v1/asr/transcribe" }
     };
+
+    const RECORDING_STATE = {
+      IDLE:         "idle",
+      REQUESTING:   "requesting",
+      RECORDING:    "recording",
+      TRANSCRIBING: "transcribing"
+    };
+
+    const RECORDING_MIME_TYPES = [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+      "audio/ogg",
+      "audio/mp4"
+    ];
 
     const STATUS = {
       READY:       { label: "就绪",   tone: "connected" },
@@ -338,11 +364,19 @@
     const statusBadge   = document.getElementById("statusBadge");
     const statusText    = document.getElementById("statusText");
     const inputEl       = document.getElementById("messageInput");
+    const recordButton  = document.getElementById("recordButton");
     const askButton     = document.getElementById("askButton");
     const stopButton    = document.getElementById("interruptButton");
     const hintEl        = document.getElementById("hint");
     const answerBox     = document.getElementById("answerBox");
     const answerText    = document.getElementById("answerText");
+
+    let recordingState = RECORDING_STATE.IDLE;
+    let mediaRecorder = null;
+    let mediaStream = null;
+    let audioChunks = [];
+    let selectedMimeType = "";
+    let recordingError = null;
 
     function setStatus(key, detail) {
       const status = STATUS[key];
@@ -354,6 +388,185 @@
     function setHint(text, tone) {
       hintEl.textContent = text;
       hintEl.dataset.tone = tone || "";
+    }
+
+    function setRecordingState(nextState) {
+      recordingState = nextState;
+      recordButton.dataset.state = nextState;
+      recordButton.disabled = nextState === RECORDING_STATE.REQUESTING ||
+        nextState === RECORDING_STATE.TRANSCRIBING;
+
+      if (nextState === RECORDING_STATE.REQUESTING) {
+        recordButton.textContent = "正在请求权限...";
+      } else if (nextState === RECORDING_STATE.RECORDING) {
+        recordButton.textContent = "🔴 录音中... 点击停止";
+      } else if (nextState === RECORDING_STATE.TRANSCRIBING) {
+        recordButton.textContent = "正在识别...";
+      } else {
+        recordButton.textContent = "🎤 开始录音";
+      }
+    }
+
+    function releaseMicrophone() {
+      if (!mediaStream) return;
+      mediaStream.getTracks().forEach(function (track) {
+        try {
+          track.stop();
+        } catch (_error) {
+          // 浏览器可能已经释放了轨道；此时无需再次处理。
+        }
+      });
+      mediaStream = null;
+    }
+
+    function chooseRecordingMimeType() {
+      if (typeof MediaRecorder === "undefined" ||
+          typeof MediaRecorder.isTypeSupported !== "function") {
+        return "";
+      }
+      return RECORDING_MIME_TYPES.find(function (mimeType) {
+        return MediaRecorder.isTypeSupported(mimeType);
+      }) || "";
+    }
+
+    function recordingFilename(mimeType) {
+      const normalized = (mimeType || "").toLowerCase();
+      if (normalized.includes("ogg")) return "recording.ogg";
+      if (normalized.includes("mp4")) return "recording.m4a";
+      if (normalized.includes("wav")) return "recording.wav";
+      return "recording.webm";
+    }
+
+    function microphoneErrorMessage(error) {
+      if (error && error.name === "NotAllowedError") {
+        return "未获得麦克风权限，请在浏览器设置中允许访问麦克风";
+      }
+      if (error && error.name === "NotFoundError") {
+        return "未找到可用的麦克风";
+      }
+      if (error && error.name === "NotReadableError") {
+        return "麦克风正被占用或暂时无法访问";
+      }
+      return "无法启动录音：" + ((error && error.message) || "未知错误");
+    }
+
+    async function startRecording() {
+      if (recordingState !== RECORDING_STATE.IDLE) return;
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setHint("当前浏览器或访问方式不支持麦克风，请使用支持 HTTPS/localhost 的现代浏览器", "error");
+        return;
+      }
+      if (typeof MediaRecorder === "undefined") {
+        setHint("当前浏览器不支持 MediaRecorder 录音", "error");
+        return;
+      }
+
+      setRecordingState(RECORDING_STATE.REQUESTING);
+      setHint("正在请求麦克风权限...");
+
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        selectedMimeType = chooseRecordingMimeType();
+        audioChunks = [];
+        recordingError = null;
+        mediaRecorder = selectedMimeType
+          ? new MediaRecorder(mediaStream, { mimeType: selectedMimeType })
+          : new MediaRecorder(mediaStream);
+
+        const recorder = mediaRecorder;
+        recorder.addEventListener("dataavailable", function (event) {
+          if (event.data && event.data.size > 0) audioChunks.push(event.data);
+        });
+        recorder.addEventListener("error", function (event) {
+          recordingError = event.error || new Error("浏览器录音失败");
+          setRecordingState(RECORDING_STATE.TRANSCRIBING);
+          setHint("录音失败：" + recordingError.message, "error");
+          releaseMicrophone();
+        });
+        recorder.addEventListener("stop", function () {
+          void transcribeRecording(recorder);
+        });
+
+        recorder.start();
+        setRecordingState(RECORDING_STATE.RECORDING);
+        setHint("正在录音，再次点击麦克风按钮停止");
+      } catch (error) {
+        releaseMicrophone();
+        mediaRecorder = null;
+        setRecordingState(RECORDING_STATE.IDLE);
+        setHint(microphoneErrorMessage(error), "error");
+      }
+    }
+
+    function stopRecording() {
+      if (recordingState !== RECORDING_STATE.RECORDING || !mediaRecorder) return;
+
+      setRecordingState(RECORDING_STATE.TRANSCRIBING);
+      setHint("录音完成，正在识别...");
+      try {
+        if (mediaRecorder.state !== "inactive") mediaRecorder.stop();
+      } catch (error) {
+        mediaRecorder = null;
+        audioChunks = [];
+        setRecordingState(RECORDING_STATE.IDLE);
+        setHint("停止录音失败：" + error.message, "error");
+      } finally {
+        releaseMicrophone();
+      }
+    }
+
+    async function transcribeRecording(recorder) {
+      try {
+        if (recordingError) throw recordingError;
+        if (!audioChunks.length) throw new Error("没有录到有效音频，请重试");
+
+        const mimeType = recorder.mimeType || selectedMimeType || audioChunks[0].type;
+        const blob = new Blob(audioChunks, mimeType ? { type: mimeType } : {});
+        if (!blob.size) throw new Error("没有录到有效音频，请重试");
+
+        const formData = new FormData();
+        formData.append("file", blob, recordingFilename(mimeType || blob.type));
+
+        const response = await fetch(API.asr.path, {
+          method: "POST",
+          body: formData
+        });
+        const data = await response.json().catch(function () { return {}; });
+
+        if (!response.ok) {
+          if (response.status === 422) throw new Error("无法识别这段录音，请重试");
+          if (response.status === 503) throw new Error("语音识别服务暂时不可用");
+          throw new Error(data.detail || ("语音识别请求失败（HTTP " + response.status + "）"));
+        }
+        if (typeof data.text !== "string" || !data.text.trim()) {
+          throw new Error("语音识别没有返回有效文本");
+        }
+
+        inputEl.value = data.text.trim();
+        inputEl.focus();
+        setHint("识别完成，请检查文字后再点击「让数字人回答」");
+      } catch (error) {
+        const message = error instanceof TypeError
+          ? "无法连接语音识别服务，请确认本地 FastAPI 正在运行"
+          : error.message;
+        setHint("语音识别失败：" + message, "error");
+      } finally {
+        if (mediaRecorder === recorder) mediaRecorder = null;
+        audioChunks = [];
+        selectedMimeType = "";
+        recordingError = null;
+        releaseMicrophone();
+        setRecordingState(RECORDING_STATE.IDLE);
+      }
+    }
+
+    function toggleRecording() {
+      if (recordingState === RECORDING_STATE.RECORDING) {
+        stopRecording();
+      } else if (recordingState === RECORDING_STATE.IDLE) {
+        void startRecording();
+      }
     }
 
     async function postJson(path, body) {
@@ -428,8 +641,11 @@
       setStatus("READY");
       setHint("输入问题后点击「让数字人回答」");
 
+      recordButton.addEventListener("click", toggleRecording);
       askButton.addEventListener("click", askQuestion);
       stopButton.addEventListener("click", interrupt);
+
+      window.addEventListener("beforeunload", releaseMicrophone);
 
       // Ctrl/Cmd + Enter 快捷发送
       inputEl.addEventListener("keydown", function (event) {
