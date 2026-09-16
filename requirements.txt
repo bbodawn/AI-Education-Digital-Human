@@ -7,3 +7,7 @@ pydantic-settings==2.14.2
 
 # 测试
 pytest==8.4.2
+
+# 一键启动器专用（scripts/）：SSH 连接与端口转发。
+# 应用本身不依赖它——只有 start.bat 需要。
+paramiko==5.0.0
