@@ -66,3 +66,9 @@ class ChatAskResponse(BaseModel):
     answer: str
     session_id: str
     verified_speaking: bool
+
+
+class ASRTranscriptionResponse(BaseModel):
+    """音频文件的最小转写结果。"""
+
+    text: str

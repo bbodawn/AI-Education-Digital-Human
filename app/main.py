@@ -9,8 +9,9 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 
-from app.api import avatar, chat
+from app.api import asr, avatar, chat
 from app.config import STATIC_DIR
+from app.services.asr import ASRTranscriptionError, ASRUnavailable
 from app.services.digital_human import DigitalHumanBadResponse, DigitalHumanUnavailable
 from app.services.llm import LLMBadResponse, LLMUnavailable
 
@@ -20,6 +21,7 @@ app = FastAPI(title="AI 数字人教育教练", version="0.1.0")
 
 app.include_router(avatar.router)
 app.include_router(chat.router)
+app.include_router(asr.router)
 
 
 @app.get("/health")
@@ -73,3 +75,17 @@ async def handle_llm_bad_response(request: Request, exc: LLMBadResponse) -> JSON
     if exc.status_code is not None:
         detail = f"{detail} (HTTP {exc.status_code})"
     return JSONResponse(status_code=502, content={"detail": detail})
+
+
+@app.exception_handler(ASRUnavailable)
+async def handle_asr_unavailable(request: Request, exc: ASRUnavailable) -> JSONResponse:
+    logger.warning("语音识别服务不可用：%s", exc)
+    return JSONResponse(status_code=503, content={"detail": "ASR service unavailable"})
+
+
+@app.exception_handler(ASRTranscriptionError)
+async def handle_asr_transcription_error(
+    request: Request, exc: ASRTranscriptionError
+) -> JSONResponse:
+    logger.warning("音频识别失败：%s", exc)
+    return JSONResponse(status_code=422, content={"detail": "Audio transcription failed"})

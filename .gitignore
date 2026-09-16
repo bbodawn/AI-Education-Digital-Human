@@ -15,6 +15,9 @@ venv/
 .coverage
 htmlcov/
 
+# 本地临时文件与测试素材
+temp/
+
 # 启动器运行时产物：状态文件记录本机 PID，日志记录服务输出，都只对本机有意义
 scripts/.runtime.json
 scripts/logs/

@@ -32,5 +32,11 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen2.5:7b"
 
+    # 本地语音识别。V0.3 Phase 1 固定走 CPU INT8，避免与 Ollama 争抢显存。
+    asr_model: str = "small"
+    asr_device: str = "cpu"
+    asr_compute_type: str = "int8"
+    asr_language: str = "zh"
+
 
 settings = Settings()
