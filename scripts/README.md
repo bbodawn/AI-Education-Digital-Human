@@ -92,11 +92,18 @@ D:\Anaconda3_2024\Anaconda3\python.exe -m venv .venv
 
 **3. 本地模型**
 
+Ollama/Qwen：
+
 ```bash
 ollama pull qwen2.5:7b
 ```
 
 启动器只检查模型在不在，**不会替你下载**。
+
+本地 ASR 使用 `faster-whisper 1.2.1` 的 `small` 模型，配置为
+CPU / INT8 / `zh`。模型缓存在项目根目录的 `models/`（已被 Git ignore）。
+`start.bat` 不会预加载 ASR 模型；首次语音识别可能需要下载并加载模型，
+因此等待时间会比后续请求更长。离线使用前应先确认 `models/` 中已有可用缓存。
 
 ## 如何判断「已经在运行」
 

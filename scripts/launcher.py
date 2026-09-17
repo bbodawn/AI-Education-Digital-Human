@@ -12,7 +12,8 @@
   * **凭据不落项目**。连接信息读 ~/.autodl_env（位于项目外，不进 Git）。
   * **只停自己启动的**。PID 记在 .runtime.json，stop 时只按记录杀，
     不会误伤用户自己的 Python / Ollama / SSH 进程。
-  * **不碰浏览器**。开不开浏览器不该影响启动是否成功。
+  * **浏览器不影响启动判定**。服务成功后会尝试自动打开页面，
+    打开失败只提示手动访问，不会把服务启动判定为失败。
 
 用法（用户只需要前两条，通常通过 start.bat / stop.bat 调用）：
     python scripts/launcher.py start

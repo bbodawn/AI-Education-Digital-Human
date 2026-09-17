@@ -17,7 +17,7 @@ from app.services.llm import LLMBadResponse, LLMUnavailable
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AI 数字人教育教练", version="0.1.0")
+app = FastAPI(title="AI 数字人教育教练", version="0.3.0")
 
 app.include_router(avatar.router)
 app.include_router(chat.router)
