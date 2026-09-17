@@ -342,7 +342,8 @@
       IDLE:         "idle",
       REQUESTING:   "requesting",
       RECORDING:    "recording",
-      TRANSCRIBING: "transcribing"
+      TRANSCRIBING: "transcribing",
+      ASKING:       "asking"
     };
 
     const RECORDING_MIME_TYPES = [
@@ -377,6 +378,7 @@
     let audioChunks = [];
     let selectedMimeType = "";
     let recordingError = null;
+    let chatRequestInFlight = false;
 
     function setStatus(key, detail) {
       const status = STATUS[key];
@@ -394,7 +396,10 @@
       recordingState = nextState;
       recordButton.dataset.state = nextState;
       recordButton.disabled = nextState === RECORDING_STATE.REQUESTING ||
-        nextState === RECORDING_STATE.TRANSCRIBING;
+        nextState === RECORDING_STATE.TRANSCRIBING ||
+        nextState === RECORDING_STATE.ASKING ||
+        chatRequestInFlight;
+      askButton.disabled = nextState !== RECORDING_STATE.IDLE || chatRequestInFlight;
 
       if (nextState === RECORDING_STATE.REQUESTING) {
         recordButton.textContent = "正在请求权限...";
@@ -402,6 +407,8 @@
         recordButton.textContent = "🔴 录音中... 点击停止";
       } else if (nextState === RECORDING_STATE.TRANSCRIBING) {
         recordButton.textContent = "正在识别...";
+      } else if (nextState === RECORDING_STATE.ASKING) {
+        recordButton.textContent = "正在思考...";
       } else {
         recordButton.textContent = "🎤 开始录音";
       }
@@ -451,7 +458,7 @@
     }
 
     async function startRecording() {
-      if (recordingState !== RECORDING_STATE.IDLE) return;
+      if (recordingState !== RECORDING_STATE.IDLE || chatRequestInFlight) return;
 
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         setHint("当前浏览器或访问方式不支持麦克风，请使用支持 HTTPS/localhost 的现代浏览器", "error");
@@ -545,7 +552,9 @@
 
         inputEl.value = data.text.trim();
         inputEl.focus();
-        setHint("识别完成，请检查文字后再点击「让数字人回答」");
+        setRecordingState(RECORDING_STATE.ASKING);
+        setHint("识别完成，正在提交问题...");
+        await askQuestion();
       } catch (error) {
         const message = error instanceof TypeError
           ? "无法连接语音识别服务，请确认本地 FastAPI 正在运行"
@@ -584,6 +593,10 @@
     }
 
     async function askQuestion() {
+      if (chatRequestInFlight) return;
+      if (recordingState !== RECORDING_STATE.IDLE &&
+          recordingState !== RECORDING_STATE.ASKING) return;
+
       const text = inputEl.value.trim();
       if (!text) {
         setHint("请先输入问题", "error");
@@ -591,7 +604,8 @@
         return;
       }
 
-      askButton.disabled = true;
+      chatRequestInFlight = true;
+      setRecordingState(RECORDING_STATE.ASKING);
       answerBox.hidden = true;
       setStatus("THINKING");
       setHint("Qwen 正在生成回答…（首次调用需要几秒）");
@@ -619,7 +633,8 @@
         setStatus("ERROR", error.message);
         setHint("提问失败：" + error.message, "error");
       } finally {
-        askButton.disabled = false;
+        chatRequestInFlight = false;
+        setRecordingState(RECORDING_STATE.IDLE);
       }
     }
 
