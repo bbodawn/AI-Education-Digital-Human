@@ -12,18 +12,20 @@
 
 import asyncio
 import logging
+import time
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.schemas import (
     ChatAskRequest,
     ChatAskResponse,
+    ChatMetrics,
     ChatInterruptResponse,
     ChatSayRequest,
     ChatSayResponse,
 )
 from app.services import get_llm_service, get_service
-from app.services.digital_human import DigitalHumanService
+from app.services.digital_human import DigitalHumanError, DigitalHumanService
 from app.services.llm import LLMService
 from app.session import get_session_id, set_session_id
 
@@ -102,6 +104,26 @@ async def _confirm_speaking(service: DigitalHumanService, session_id: str) -> bo
     return False
 
 
+async def _observe_speaking_baseline(
+    service: DigitalHumanService, session_id: str
+) -> bool | None:
+    """尽力取得发送本轮回答前的播报状态，仅用于指标判定。
+
+    这是观测能力，不是业务前置条件。查询失败时返回 None，后续 /human 与原有
+    speaking 确认仍照常执行，避免指标故障改变问答成功语义。
+    """
+    try:
+        return await service.is_speaking(session_id)
+    except DigitalHumanError as exc:
+        logger.warning("起播指标基线查询失败，继续正常播报：%s", exc)
+        return None
+
+
+def _elapsed_ms(started_at: float, finished_at: float) -> int:
+    """把单调时钟差转换为非负整数毫秒。"""
+    return max(0, round((finished_at - started_at) * 1000))
+
+
 @router.post("/say", response_model=ChatSayResponse)
 async def chat_say(
     payload: ChatSayRequest,
@@ -149,7 +171,10 @@ async def chat_ask(
     # 记下开始生成时的打断计数，生成结束后比对
     epoch = _current_interrupt_epoch()
 
+    llm_started_at = time.perf_counter()
     answer = await llm.chat(payload.text)
+    answer_ready_at = time.perf_counter()
+    llm_ms = _elapsed_ms(llm_started_at, answer_ready_at)
     logger.info("模型回答生成完成（%d 字），sessionid=%s", len(answer), session_id)
 
     if _current_interrupt_epoch() != epoch:
@@ -161,8 +186,14 @@ async def chat_ask(
             answer=answer,
             session_id=session_id,
             verified_speaking=False,
+            metrics=ChatMetrics(
+                llm_ms=llm_ms,
+                avatar_startup_ms=None,
+                avatar_startup_status="cancelled",
+            ),
         )
 
+    speaking_baseline = await _observe_speaking_baseline(service, session_id)
     await service.say(session_id=session_id, text=answer, interrupt=False)
 
     verified = await _confirm_speaking(service, session_id)
@@ -173,12 +204,28 @@ async def chat_ask(
             session_id,
         )
 
+    avatar_startup_ms: int | None = None
+    if speaking_baseline is True:
+        avatar_startup_status = "already_speaking"
+    elif speaking_baseline is None:
+        avatar_startup_status = "unavailable"
+    elif verified:
+        avatar_startup_ms = _elapsed_ms(answer_ready_at, time.perf_counter())
+        avatar_startup_status = "measured"
+    else:
+        avatar_startup_status = "not_observed"
+
     return ChatAskResponse(
         status="accepted" if verified else "accepted_unverified",
         question=payload.text,
         answer=answer,
         session_id=session_id,
         verified_speaking=verified,
+        metrics=ChatMetrics(
+            llm_ms=llm_ms,
+            avatar_startup_ms=avatar_startup_ms,
+            avatar_startup_status=avatar_startup_status,
+        ),
     )
 
 

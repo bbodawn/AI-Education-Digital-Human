@@ -68,10 +68,10 @@ DEFAULT_RESPONSES = {
 
 @pytest.fixture(autouse=True)
 def _isolated_state(monkeypatch):
-    """每个用例都从「没有会话」开始，并把播报轮询压到毫秒级。"""
+    """每个用例都从「没有会话」开始，并去掉播报轮询等待。"""
     clear_session_id()
     monkeypatch.setattr(chat, "_SPEAKING_POLL_ATTEMPTS", 2)
-    monkeypatch.setattr(chat, "_SPEAKING_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(chat, "_SPEAKING_POLL_INTERVAL", 0)
     # 打断计数是模块级全局，不清零会让上一个用例的打断影响到下一个
     monkeypatch.setattr(chat, "_interrupt_epoch", 0)
     yield
@@ -93,7 +93,10 @@ def recording_handler(recorder, responses=None):
 
     def handler(request: httpx.Request) -> httpx.Response:
         recorder.append(request)
-        return httpx.Response(200, json=merged.get(request.url.path, {"code": 0, "msg": "ok", "data": {}}))
+        response = merged.get(request.url.path, {"code": 0, "msg": "ok", "data": {}})
+        if callable(response):
+            response = response()
+        return httpx.Response(200, json=response)
 
     return handler
 
@@ -134,6 +137,13 @@ def test_root_serves_frontend_page() -> None:
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
     assert "AI 数字人教育教练" in response.text
+    assert 'id="responseMetrics"' in response.text
+    assert 'id="asrLatency">—' in response.text
+    assert 'id="llmLatency">—' in response.text
+    assert 'id="avatarLatency">—' in response.text
+    assert 'id="totalLatency">—' in response.text
+    assert "数字人起播确认" in response.text
+    assert "if (!fromVoice) resetMetrics();" in response.text
 
 
 # --------------------------------------------------------------------------
@@ -390,7 +400,20 @@ def test_ask_generates_answer_then_speaks_it() -> None:
     """
     requests = []
     llm = StubLLM()
-    client = build_client(recording_handler(requests), llm=llm)
+    speaking_states = iter([False, True])
+    client = build_client(
+        recording_handler(
+            requests,
+            {
+                "/is_speaking": lambda: {
+                    "code": 0,
+                    "msg": "ok",
+                    "data": next(speaking_states),
+                }
+            },
+        ),
+        llm=llm,
+    )
 
     response = client.post("/api/v1/chat/ask", json={"text": QUESTION})
 
@@ -400,6 +423,10 @@ def test_ask_generates_answer_then_speaks_it() -> None:
     assert body["answer"] == MODEL_ANSWER
     assert body["status"] == "accepted"
     assert body["verified_speaking"] is True
+    assert body["metrics"]["llm_ms"] >= 0
+    assert body["metrics"]["avatar_startup_ms"] is not None
+    assert body["metrics"]["avatar_startup_ms"] >= 0
+    assert body["metrics"]["avatar_startup_status"] == "measured"
 
     assert llm.questions == [QUESTION]
     human = next(r for r in requests if r.url.path == "/human")
@@ -463,6 +490,9 @@ def test_ask_skips_speech_when_interrupted_during_generation() -> None:
     assert body["status"] == "cancelled"
     assert body["answer"] == MODEL_ANSWER
     assert body["verified_speaking"] is False
+    assert body["metrics"]["llm_ms"] >= 0
+    assert body["metrics"]["avatar_startup_ms"] is None
+    assert body["metrics"]["avatar_startup_status"] == "cancelled"
     assert "/human" not in paths_of(requests)
 
 
@@ -473,8 +503,61 @@ def test_ask_reports_unverified_when_speaking_never_observed() -> None:
 
     response = client.post("/api/v1/chat/ask", json={"text": QUESTION})
 
-    assert response.json()["status"] == "accepted_unverified"
-    assert response.json()["verified_speaking"] is False
+    body = response.json()
+    assert body["status"] == "accepted_unverified"
+    assert body["verified_speaking"] is False
+    assert body["metrics"]["avatar_startup_ms"] is None
+    assert body["metrics"]["avatar_startup_status"] == "not_observed"
+
+
+def test_ask_does_not_measure_new_start_when_avatar_is_already_speaking() -> None:
+    """上一轮尚在播报时，当前 true 不能冒充本轮起播转换。"""
+    requests = []
+    client = build_client(recording_handler(requests))
+
+    response = client.post("/api/v1/chat/ask", json={"text": QUESTION})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "accepted"
+    assert body["verified_speaking"] is True
+    assert body["metrics"]["llm_ms"] >= 0
+    assert body["metrics"]["avatar_startup_ms"] is None
+    assert body["metrics"]["avatar_startup_status"] == "already_speaking"
+    assert "/human" in paths_of(requests)
+
+
+def test_ask_keeps_working_when_metrics_baseline_is_unavailable() -> None:
+    """指标基线查询失败不得改变原有播报成功语义。"""
+    requests = []
+    speaking_calls = 0
+
+    def baseline_fails_once(request: httpx.Request) -> httpx.Response:
+        nonlocal speaking_calls
+        requests.append(request)
+        if request.url.path == "/is_speaking":
+            speaking_calls += 1
+            if speaking_calls == 1:
+                return httpx.Response(500, text="metrics unavailable")
+        return httpx.Response(
+            200,
+            json=DEFAULT_RESPONSES.get(
+                request.url.path, {"code": 0, "msg": "ok", "data": {}}
+            ),
+        )
+
+    client = build_client(baseline_fails_once)
+
+    response = client.post("/api/v1/chat/ask", json={"text": QUESTION})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["answer"] == MODEL_ANSWER
+    assert body["status"] == "accepted"
+    assert body["verified_speaking"] is True
+    assert body["metrics"]["avatar_startup_ms"] is None
+    assert body["metrics"]["avatar_startup_status"] == "unavailable"
+    assert "/human" in paths_of(requests)
 
 
 def test_ask_rejects_empty_question() -> None:

@@ -51,6 +51,14 @@ class ChatAskRequest(BaseModel):
     text: str = Field(min_length=1)
 
 
+class ChatMetrics(BaseModel):
+    """一次问答中可观测到的服务端阶段耗时。"""
+
+    llm_ms: int = Field(ge=0)
+    avatar_startup_ms: int | None = Field(default=None, ge=0)
+    avatar_startup_status: str
+
+
 class ChatAskResponse(BaseModel):
     """一次「提问 → 模型生成 → 数字人朗读」的完整结果。
 
@@ -66,6 +74,7 @@ class ChatAskResponse(BaseModel):
     answer: str
     session_id: str
     verified_speaking: bool
+    metrics: ChatMetrics
 
 
 class ASRTranscriptionResponse(BaseModel):

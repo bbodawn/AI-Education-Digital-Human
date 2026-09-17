@@ -221,6 +221,36 @@
       white-space: pre-wrap;
     }
 
+    .metrics {
+      margin-top: 12px;
+      padding: 12px 14px;
+      background: #f8fafc;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+
+    .metrics-title {
+      margin-bottom: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 6px 16px;
+      margin: 0;
+      font-size: 13px;
+    }
+
+    .metrics-grid dt { color: var(--muted); }
+    .metrics-grid dd {
+      margin: 0;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+    }
+
     .note {
       margin: 12px 0 0;
       font-size: 12.5px;
@@ -306,6 +336,16 @@
           <div class="answer-label">数字人回答</div>
           <div class="answer-text" id="answerText"></div>
         </div>
+
+        <div class="metrics" id="responseMetrics" hidden>
+          <div class="metrics-title">本轮响应耗时</div>
+          <dl class="metrics-grid">
+            <dt>语音识别</dt><dd id="asrLatency">—</dd>
+            <dt>AI 回答生成</dt><dd id="llmLatency">—</dd>
+            <dt>数字人起播确认</dt><dd id="avatarLatency">—</dd>
+            <dt>总响应</dt><dd id="totalLatency">—</dd>
+          </dl>
+        </div>
       </section>
     </div>
 
@@ -371,6 +411,11 @@
     const hintEl        = document.getElementById("hint");
     const answerBox     = document.getElementById("answerBox");
     const answerText    = document.getElementById("answerText");
+    const metricsBox    = document.getElementById("responseMetrics");
+    const asrLatencyEl  = document.getElementById("asrLatency");
+    const llmLatencyEl  = document.getElementById("llmLatency");
+    const avatarLatencyEl = document.getElementById("avatarLatency");
+    const totalLatencyEl  = document.getElementById("totalLatency");
 
     let recordingState = RECORDING_STATE.IDLE;
     let mediaRecorder = null;
@@ -379,6 +424,7 @@
     let selectedMimeType = "";
     let recordingError = null;
     let chatRequestInFlight = false;
+    let recordingStoppedAt = null;
 
     function setStatus(key, detail) {
       const status = STATUS[key];
@@ -390,6 +436,36 @@
     function setHint(text, tone) {
       hintEl.textContent = text;
       hintEl.dataset.tone = tone || "";
+    }
+
+    function formatDuration(ms) {
+      return Number.isFinite(ms) && ms >= 0 ? (ms / 1000).toFixed(2) + " s" : "—";
+    }
+
+    function resetMetrics() {
+      metricsBox.hidden = true;
+      asrLatencyEl.textContent = "—";
+      llmLatencyEl.textContent = "—";
+      avatarLatencyEl.textContent = "—";
+      totalLatencyEl.textContent = "—";
+    }
+
+    function renderMetrics(data, asrMs, totalStartedAt, totalFinishedAt) {
+      const metrics = data.metrics || {};
+      const avatarMeasured = metrics.avatar_startup_status === "measured" &&
+        Number.isFinite(metrics.avatar_startup_ms);
+      const totalMs = avatarMeasured && data.verified_speaking &&
+        Number.isFinite(totalStartedAt)
+        ? Math.max(0, totalFinishedAt - totalStartedAt)
+        : null;
+
+      asrLatencyEl.textContent = formatDuration(asrMs);
+      llmLatencyEl.textContent = formatDuration(metrics.llm_ms);
+      avatarLatencyEl.textContent = avatarMeasured
+        ? formatDuration(metrics.avatar_startup_ms)
+        : "—";
+      totalLatencyEl.textContent = formatDuration(totalMs);
+      metricsBox.hidden = false;
     }
 
     function setRecordingState(nextState) {
@@ -469,6 +545,8 @@
         return;
       }
 
+      resetMetrics();
+      recordingStoppedAt = null;
       setRecordingState(RECORDING_STATE.REQUESTING);
       setHint("正在请求麦克风权限...");
 
@@ -511,11 +589,13 @@
 
       setRecordingState(RECORDING_STATE.TRANSCRIBING);
       setHint("录音完成，正在识别...");
+      recordingStoppedAt = performance.now();
       try {
         if (mediaRecorder.state !== "inactive") mediaRecorder.stop();
       } catch (error) {
         mediaRecorder = null;
         audioChunks = [];
+        recordingStoppedAt = null;
         setRecordingState(RECORDING_STATE.IDLE);
         setHint("停止录音失败：" + error.message, "error");
       } finally {
@@ -550,12 +630,19 @@
           throw new Error("语音识别没有返回有效文本");
         }
 
+        const transcriptReadyAt = performance.now();
+        const totalStartedAt = recordingStoppedAt;
+        const asrMs = Number.isFinite(totalStartedAt)
+          ? Math.max(0, transcriptReadyAt - totalStartedAt)
+          : null;
+        recordingStoppedAt = null;
         inputEl.value = data.text.trim();
         inputEl.focus();
         setRecordingState(RECORDING_STATE.ASKING);
         setHint("识别完成，正在提交问题...");
-        await askQuestion();
+        await askQuestion({ source: "voice", asrMs: asrMs, totalStartedAt: totalStartedAt });
       } catch (error) {
+        recordingStoppedAt = null;
         const message = error instanceof TypeError
           ? "无法连接语音识别服务，请确认本地 FastAPI 正在运行"
           : error.message;
@@ -592,7 +679,7 @@
       return data;
     }
 
-    async function askQuestion() {
+    async function askQuestion(context) {
       if (chatRequestInFlight) return;
       if (recordingState !== RECORDING_STATE.IDLE &&
           recordingState !== RECORDING_STATE.ASKING) return;
@@ -604,6 +691,13 @@
         return;
       }
 
+      const fromVoice = context && context.source === "voice";
+      if (!fromVoice) resetMetrics();
+      const asrMs = fromVoice ? context.asrMs : null;
+      const totalStartedAt = fromVoice && Number.isFinite(context.totalStartedAt)
+        ? context.totalStartedAt
+        : performance.now();
+
       chatRequestInFlight = true;
       setRecordingState(RECORDING_STATE.ASKING);
       answerBox.hidden = true;
@@ -612,12 +706,14 @@
 
       try {
         const data = await postJson(API.ask.path, { text: text });
+        const totalFinishedAt = performance.now();
 
         // 无论播不播，都先把模型生成的内容显示出来——
         // 这样用户能对照「AI 想说什么」和「数字人说了什么」。
         answerText.textContent = data.answer;
         answerBox.hidden = false;
         inputEl.value = "";
+        renderMetrics(data, asrMs, totalStartedAt, totalFinishedAt);
 
         if (data.status === "cancelled") {
           setStatus("INTERRUPTED");
@@ -630,6 +726,7 @@
           setHint("回答已受理，但未观察到播报状态——若画面没反应，请看 FastAPI 日志", "error");
         }
       } catch (error) {
+        resetMetrics();
         setStatus("ERROR", error.message);
         setHint("提问失败：" + error.message, "error");
       } finally {
