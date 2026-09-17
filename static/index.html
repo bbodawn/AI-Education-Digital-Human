@@ -169,6 +169,7 @@
     #sendButton:hover { background: #1d4ed8; }
 
     #recordButton,
+    #resetButton,
     #interruptButton {
       background: #fff;
       color: var(--text);
@@ -176,6 +177,7 @@
     }
 
     #recordButton:hover,
+    #resetButton:hover,
     #interruptButton:hover { background: #f7f9fb; }
 
     #recordButton[data-state="recording"] {
@@ -327,6 +329,7 @@
         <div class="actions">
           <button id="recordButton" type="button" data-state="idle">🎤 开始录音</button>
           <button id="askButton" type="button">让数字人回答</button>
+          <button id="resetButton" type="button">新对话</button>
           <button id="interruptButton" type="button">打断</button>
         </div>
 
@@ -354,6 +357,7 @@
       <ul class="endpoints">
         <li><span class="method">GET</span><code>/health</code></li>
         <li><span class="method">POST</span><code>/api/v1/chat/ask</code></li>
+        <li><span class="method">POST</span><code>/api/v1/chat/reset</code></li>
         <li><span class="method">POST</span><code>/api/v1/chat/say</code></li>
         <li><span class="method">POST</span><code>/api/v1/chat/interrupt</code></li>
         <li><span class="method">POST</span><code>/api/v1/asr/transcribe</code></li>
@@ -374,6 +378,7 @@
      * ------------------------------------------------------------------ */
     const API = {
       ask:       { path: "/api/v1/chat/ask" },
+      reset:     { path: "/api/v1/chat/reset" },
       interrupt: { path: "/api/v1/chat/interrupt" },
       asr:       { path: "/api/v1/asr/transcribe" }
     };
@@ -407,6 +412,7 @@
     const inputEl       = document.getElementById("messageInput");
     const recordButton  = document.getElementById("recordButton");
     const askButton     = document.getElementById("askButton");
+    const resetButton   = document.getElementById("resetButton");
     const stopButton    = document.getElementById("interruptButton");
     const hintEl        = document.getElementById("hint");
     const answerBox     = document.getElementById("answerBox");
@@ -424,6 +430,7 @@
     let selectedMimeType = "";
     let recordingError = null;
     let chatRequestInFlight = false;
+    let conversationResetInFlight = false;
     let recordingStoppedAt = null;
 
     function setStatus(key, detail) {
@@ -470,12 +477,14 @@
 
     function setRecordingState(nextState) {
       recordingState = nextState;
+      const interactionBusy = chatRequestInFlight || conversationResetInFlight;
       recordButton.dataset.state = nextState;
       recordButton.disabled = nextState === RECORDING_STATE.REQUESTING ||
         nextState === RECORDING_STATE.TRANSCRIBING ||
         nextState === RECORDING_STATE.ASKING ||
-        chatRequestInFlight;
-      askButton.disabled = nextState !== RECORDING_STATE.IDLE || chatRequestInFlight;
+        interactionBusy;
+      askButton.disabled = nextState !== RECORDING_STATE.IDLE || interactionBusy;
+      resetButton.disabled = nextState !== RECORDING_STATE.IDLE || interactionBusy;
 
       if (nextState === RECORDING_STATE.REQUESTING) {
         recordButton.textContent = "正在请求权限...";
@@ -545,7 +554,6 @@
         return;
       }
 
-      resetMetrics();
       recordingStoppedAt = null;
       setRecordingState(RECORDING_STATE.REQUESTING);
       setHint("正在请求麦克风权限...");
@@ -749,12 +757,39 @@
       }
     }
 
+    async function startNewConversation() {
+      if (chatRequestInFlight || conversationResetInFlight ||
+          recordingState !== RECORDING_STATE.IDLE) return;
+
+      conversationResetInFlight = true;
+      setRecordingState(RECORDING_STATE.IDLE);
+      setHint("正在开始新对话...");
+
+      try {
+        await postJson(API.reset.path);
+        inputEl.value = "";
+        answerText.textContent = "";
+        answerBox.hidden = true;
+        resetMetrics();
+        setStatus("READY");
+        setHint("已开始新对话");
+        inputEl.focus();
+      } catch (error) {
+        setStatus("ERROR", error.message);
+        setHint("新对话失败：" + error.message, "error");
+      } finally {
+        conversationResetInFlight = false;
+        setRecordingState(RECORDING_STATE.IDLE);
+      }
+    }
+
     function init() {
       setStatus("READY");
       setHint("输入问题后点击「让数字人回答」");
 
       recordButton.addEventListener("click", toggleRecording);
       askButton.addEventListener("click", askQuestion);
+      resetButton.addEventListener("click", startNewConversation);
       stopButton.addEventListener("click", interrupt);
 
       window.addEventListener("beforeunload", releaseMicrophone);

@@ -45,6 +45,13 @@ class ChatInterruptResponse(BaseModel):
     status: str = "interrupted"
 
 
+class ChatResetResponse(BaseModel):
+    """当前数字人会话的短期对话上下文已清空。"""
+
+    status: str = "reset"
+    session_id: str
+
+
 class ChatAskRequest(BaseModel):
     """向数字人提一个问题，由本地大模型作答。"""
 

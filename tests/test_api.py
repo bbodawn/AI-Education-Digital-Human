@@ -9,18 +9,22 @@
   4. LiveTalking 出问题时，浏览器收到可读的 JSON 而不是 Python traceback
 """
 
+import asyncio
 import json
+from collections.abc import Sequence
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from app.api import chat
+from app.conversation import ChatMessage, ConversationStore
 from app.main import app
+from app.schemas import ChatAskRequest
 from app.services import get_llm_service, get_service
 from app.services.digital_human import LiveTalkingService
 from app.services.llm import LLMBadResponse, LLMService, LLMUnavailable
-from app.session import clear_session_id
+from app.session import clear_session_id, set_session_id
 
 BASE_URL = "http://127.0.0.1:8010"
 SESSION_ID = "4b0e14eb-b468-4058-a181-b44b3bba3e30"
@@ -39,15 +43,44 @@ class StubLLM(LLMService):
         self.answer = answer
         self.error = error
         self.on_chat = on_chat
-        self.questions: list[str] = []
+        self.calls: list[list[ChatMessage]] = []
 
-    async def chat(self, text: str) -> str:
-        self.questions.append(text)
+    async def chat(self, messages: Sequence[ChatMessage]) -> str:
+        self.calls.append(
+            [
+                {"role": message["role"], "content": message["content"]}
+                for message in messages
+            ]
+        )
         if self.on_chat is not None:
             self.on_chat()
         if self.error is not None:
             raise self.error
         return self.answer
+
+
+class SequencedLLM(LLMService):
+    """按调用顺序返回答案或抛异常，并记录每次收到的完整 messages。"""
+
+    def __init__(self, outcomes, on_call=None):
+        self.outcomes = list(outcomes)
+        self.on_call = on_call
+        self.calls: list[list[ChatMessage]] = []
+
+    async def chat(self, messages: Sequence[ChatMessage]) -> str:
+        self.calls.append(
+            [
+                {"role": message["role"], "content": message["content"]}
+                for message in messages
+            ]
+        )
+        call_number = len(self.calls)
+        if self.on_call is not None:
+            self.on_call(call_number)
+        outcome = self.outcomes[call_number - 1]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
 OFFER_ANSWER = {"sdp": "mock-answer-sdp", "type": "answer", "sessionid": SESSION_ID}
 
@@ -70,6 +103,7 @@ DEFAULT_RESPONSES = {
 def _isolated_state(monkeypatch):
     """每个用例都从「没有会话」开始，并去掉播报轮询等待。"""
     clear_session_id()
+    monkeypatch.setattr(chat, "conversation_store", ConversationStore())
     monkeypatch.setattr(chat, "_SPEAKING_POLL_ATTEMPTS", 2)
     monkeypatch.setattr(chat, "_SPEAKING_POLL_INTERVAL", 0)
     # 打断计数是模块级全局，不清零会让上一个用例的打断影响到下一个
@@ -79,7 +113,7 @@ def _isolated_state(monkeypatch):
     app.dependency_overrides.clear()
 
 
-def build_client(handler, llm: StubLLM | None = None) -> TestClient:
+def build_client(handler, llm: LLMService | None = None) -> TestClient:
     """把应用里的数字人服务（和模型）替换成测试替身。"""
     service = LiveTalkingService(base_url=BASE_URL, transport=httpx.MockTransport(handler))
     app.dependency_overrides[get_service] = lambda: service
@@ -144,6 +178,34 @@ def test_root_serves_frontend_page() -> None:
     assert 'id="totalLatency">—' in response.text
     assert "数字人起播确认" in response.text
     assert "if (!fromVoice) resetMetrics();" in response.text
+
+
+def test_homepage_exposes_new_conversation_reset_controls() -> None:
+    client = build_client(recording_handler([]))
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert 'id="resetButton"' in response.text
+    assert 'reset:     { path: "/api/v1/chat/reset" }' in response.text
+    assert "await postJson(API.reset.path);" in response.text
+    assert "resetButton.disabled = nextState !== RECORDING_STATE.IDLE || interactionBusy;" in response.text
+    assert 'setHint("已开始新对话");' in response.text
+
+
+def test_start_recording_preserves_existing_conversation_ui() -> None:
+    client = build_client(recording_handler([]))
+
+    response = client.get("/")
+    start_recording = response.text.split(
+        "async function startRecording()", 1
+    )[1].split("function stopRecording()", 1)[0]
+
+    assert "resetMetrics()" not in start_recording
+    assert "answerBox.hidden" not in start_recording
+    assert "answerText.textContent" not in start_recording
+    assert "inputEl.value" not in start_recording
+    assert "API.reset.path" not in start_recording
 
 
 # --------------------------------------------------------------------------
@@ -428,7 +490,7 @@ def test_ask_generates_answer_then_speaks_it() -> None:
     assert body["metrics"]["avatar_startup_ms"] >= 0
     assert body["metrics"]["avatar_startup_status"] == "measured"
 
-    assert llm.questions == [QUESTION]
+    assert llm.calls == [[{"role": "user", "content": QUESTION}]]
     human = next(r for r in requests if r.url.path == "/human")
     payload = json.loads(human.content)
     assert payload["text"] == MODEL_ANSWER
@@ -473,7 +535,7 @@ def test_ask_checks_session_before_spending_a_generation() -> None:
     response = client.post("/api/v1/chat/ask", json={"text": QUESTION})
 
     assert response.status_code == 409
-    assert llm.questions == []
+    assert llm.calls == []
 
 
 def test_ask_skips_speech_when_interrupted_during_generation() -> None:
@@ -531,6 +593,7 @@ def test_ask_keeps_working_when_metrics_baseline_is_unavailable() -> None:
     """指标基线查询失败不得改变原有播报成功语义。"""
     requests = []
     speaking_calls = 0
+    llm = StubLLM()
 
     def baseline_fails_once(request: httpx.Request) -> httpx.Response:
         nonlocal speaking_calls
@@ -546,9 +609,10 @@ def test_ask_keeps_working_when_metrics_baseline_is_unavailable() -> None:
             ),
         )
 
-    client = build_client(baseline_fails_once)
+    client = build_client(baseline_fails_once, llm=llm)
 
     response = client.post("/api/v1/chat/ask", json={"text": QUESTION})
+    next_response = client.post("/api/v1/chat/ask", json={"text": "继续解释。"})
 
     assert response.status_code == 200
     body = response.json()
@@ -558,6 +622,268 @@ def test_ask_keeps_working_when_metrics_baseline_is_unavailable() -> None:
     assert body["metrics"]["avatar_startup_ms"] is None
     assert body["metrics"]["avatar_startup_status"] == "unavailable"
     assert "/human" in paths_of(requests)
+    assert next_response.status_code == 200
+    assert llm.calls[1] == [
+        {"role": "user", "content": QUESTION},
+        {"role": "assistant", "content": MODEL_ANSWER},
+        {"role": "user", "content": "继续解释。"},
+    ]
+
+
+def test_ask_second_round_receives_first_successful_turn() -> None:
+    llm = SequencedLLM(
+        ["RAG 是检索增强生成。", "它先检索可靠资料，再基于资料生成回答。"]
+    )
+    client = build_client(recording_handler([]), llm=llm)
+
+    first = client.post("/api/v1/chat/ask", json={"text": "什么是 RAG？"})
+    second = client.post("/api/v1/chat/ask", json={"text": "那它为什么更可靠？"})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert llm.calls[1] == [
+        {"role": "user", "content": "什么是 RAG？"},
+        {"role": "assistant", "content": "RAG 是检索增强生成。"},
+        {"role": "user", "content": "那它为什么更可靠？"},
+    ]
+
+
+def test_ask_history_trims_only_after_sixth_turn_commits() -> None:
+    llm = SequencedLLM([f"A{index}" for index in range(1, 8)])
+    client = build_client(recording_handler([]), llm=llm)
+
+    for index in range(1, 7):
+        response = client.post("/api/v1/chat/ask", json={"text": f"Q{index}"})
+        assert response.status_code == 200
+
+    expected_sixth_call = []
+    for index in range(1, 6):
+        expected_sixth_call.extend(
+            [
+                {"role": "user", "content": f"Q{index}"},
+                {"role": "assistant", "content": f"A{index}"},
+            ]
+        )
+    expected_sixth_call.append({"role": "user", "content": "Q6"})
+    assert llm.calls[5] == expected_sixth_call
+
+    stored_after_sixth = chat.conversation_store.get_messages(SESSION_ID)
+    assert stored_after_sixth[0] == {"role": "user", "content": "Q2"}
+    assert stored_after_sixth[-1] == {"role": "assistant", "content": "A6"}
+
+    seventh = client.post("/api/v1/chat/ask", json={"text": "Q7"})
+
+    assert seventh.status_code == 200
+    assert {"role": "user", "content": "Q1"} not in llm.calls[6]
+    assert {"role": "assistant", "content": "A1"} not in llm.calls[6]
+    assert llm.calls[6][0] == {"role": "user", "content": "Q2"}
+    assert llm.calls[6][-1] == {"role": "user", "content": "Q7"}
+
+
+def test_ask_llm_failure_does_not_pollute_history() -> None:
+    llm = SequencedLLM(["A1", LLMBadResponse("生成失败"), "A3"])
+    client = build_client(recording_handler([]), llm=llm)
+
+    assert client.post("/api/v1/chat/ask", json={"text": "Q1"}).status_code == 200
+    assert client.post("/api/v1/chat/ask", json={"text": "Q2"}).status_code == 502
+    assert client.post("/api/v1/chat/ask", json={"text": "Q3"}).status_code == 200
+
+    assert llm.calls[2] == [
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant", "content": "A1"},
+        {"role": "user", "content": "Q3"},
+    ]
+
+
+def test_ask_live_talking_failure_does_not_pollute_history() -> None:
+    requests = []
+    human_calls = 0
+
+    def fail_second_human(request: httpx.Request) -> httpx.Response:
+        nonlocal human_calls
+        requests.append(request)
+        if request.url.path == "/human":
+            human_calls += 1
+            if human_calls == 2:
+                return httpx.Response(500, text="avatar unavailable")
+        return httpx.Response(
+            200,
+            json=DEFAULT_RESPONSES.get(
+                request.url.path, {"code": 0, "msg": "ok", "data": {}}
+            ),
+        )
+
+    llm = SequencedLLM(["A1", "A2", "A3"])
+    client = build_client(fail_second_human, llm=llm)
+
+    assert client.post("/api/v1/chat/ask", json={"text": "Q1"}).status_code == 200
+    assert client.post("/api/v1/chat/ask", json={"text": "Q2"}).status_code == 502
+    assert client.post("/api/v1/chat/ask", json={"text": "Q3"}).status_code == 200
+
+    assert llm.calls[2] == [
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant", "content": "A1"},
+        {"role": "user", "content": "Q3"},
+    ]
+
+
+def test_ask_cancelled_turn_does_not_pollute_history() -> None:
+    def interrupt_second_call(call_number: int) -> None:
+        if call_number == 2:
+            chat._bump_interrupt_epoch()
+
+    llm = SequencedLLM(["A1", "A2", "A3"], on_call=interrupt_second_call)
+    client = build_client(recording_handler([]), llm=llm)
+
+    assert client.post("/api/v1/chat/ask", json={"text": "Q1"}).status_code == 200
+    cancelled = client.post("/api/v1/chat/ask", json={"text": "Q2"})
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+    assert client.post("/api/v1/chat/ask", json={"text": "Q3"}).status_code == 200
+
+    assert llm.calls[2] == [
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant", "content": "A1"},
+        {"role": "user", "content": "Q3"},
+    ]
+
+
+def test_ask_accepted_unverified_turn_is_committed() -> None:
+    llm = SequencedLLM(["A1", "A2"])
+    client = build_client(
+        recording_handler([], {"/is_speaking": {"code": 0, "msg": "ok", "data": False}}),
+        llm=llm,
+    )
+
+    first = client.post("/api/v1/chat/ask", json={"text": "Q1"})
+    second = client.post("/api/v1/chat/ask", json={"text": "Q2"})
+
+    assert first.json()["status"] == "accepted_unverified"
+    assert second.status_code == 200
+    assert llm.calls[1] == [
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant", "content": "A1"},
+        {"role": "user", "content": "Q2"},
+    ]
+
+
+def test_ask_serializes_concurrent_requests_for_same_session() -> None:
+    class BlockingFirstLLM(LLMService):
+        def __init__(self) -> None:
+            self.calls: list[list[ChatMessage]] = []
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+
+        async def chat(self, messages: Sequence[ChatMessage]) -> str:
+            self.calls.append(
+                [
+                    {"role": message["role"], "content": message["content"]}
+                    for message in messages
+                ]
+            )
+            call_number = len(self.calls)
+            if call_number == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            return f"A{call_number}"
+
+    requests = []
+    service = LiveTalkingService(
+        base_url=BASE_URL,
+        transport=httpx.MockTransport(recording_handler(requests)),
+    )
+    llm = BlockingFirstLLM()
+    set_session_id(SESSION_ID)
+
+    async def run_concurrently() -> None:
+        first = asyncio.create_task(
+            chat.chat_ask(ChatAskRequest(text="Q1"), service=service, llm=llm)
+        )
+        await llm.first_started.wait()
+        second = asyncio.create_task(
+            chat.chat_ask(ChatAskRequest(text="Q2"), service=service, llm=llm)
+        )
+        await asyncio.sleep(0)
+        assert len(llm.calls) == 1
+        llm.release_first.set()
+        await asyncio.gather(first, second)
+
+    asyncio.run(run_concurrently())
+
+    assert llm.calls == [
+        [{"role": "user", "content": "Q1"}],
+        [
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "A1"},
+            {"role": "user", "content": "Q2"},
+        ],
+    ]
+
+
+def test_reset_clears_history_before_next_question() -> None:
+    llm = SequencedLLM(["A1", "A2"])
+    client = build_client(recording_handler([]), llm=llm)
+
+    first = client.post("/api/v1/chat/ask", json={"text": "Q1"})
+    reset = client.post("/api/v1/chat/reset")
+    second = client.post("/api/v1/chat/ask", json={"text": "Q2"})
+
+    assert first.status_code == 200
+    assert reset.status_code == 200
+    assert reset.json() == {"status": "reset", "session_id": SESSION_ID}
+    assert second.status_code == 200
+    assert llm.calls[1] == [{"role": "user", "content": "Q2"}]
+
+
+def test_reset_is_idempotent_for_empty_history() -> None:
+    client = build_client(recording_handler([]))
+
+    first = client.post("/api/v1/chat/reset")
+    second = client.post("/api/v1/chat/reset")
+
+    assert first.status_code == 200
+    assert first.json() == {"status": "reset", "session_id": SESSION_ID}
+    assert second.status_code == 200
+    assert second.json() == first.json()
+
+
+def test_reset_waits_for_in_flight_ask_then_clears_committed_turn() -> None:
+    class BlockingLLM(LLMService):
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def chat(self, messages: Sequence[ChatMessage]) -> str:
+            assert messages == [{"role": "user", "content": "Q1"}]
+            self.started.set()
+            await self.release.wait()
+            return "A1"
+
+    service = LiveTalkingService(
+        base_url=BASE_URL,
+        transport=httpx.MockTransport(recording_handler([])),
+    )
+    llm = BlockingLLM()
+    set_session_id(SESSION_ID)
+
+    async def ask_then_reset() -> None:
+        ask_task = asyncio.create_task(
+            chat.chat_ask(ChatAskRequest(text="Q1"), service=service, llm=llm)
+        )
+        await llm.started.wait()
+
+        reset_task = asyncio.create_task(chat.chat_reset(service=service))
+        await asyncio.sleep(0)
+        assert not reset_task.done()
+
+        llm.release.set()
+        ask_response, reset_response = await asyncio.gather(ask_task, reset_task)
+        assert ask_response.status == "accepted"
+        assert reset_response.status == "reset"
+
+    asyncio.run(ask_then_reset())
+
+    assert chat.conversation_store.get_messages(SESSION_ID) == []
 
 
 def test_ask_rejects_empty_question() -> None:

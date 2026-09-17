@@ -8,9 +8,12 @@
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import Any
 
 import httpx
+
+from app.conversation import ChatMessage
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +43,8 @@ class LLMService(ABC):
     """大模型服务接口。业务层只依赖它。"""
 
     @abstractmethod
-    async def chat(self, text: str) -> str:
-        """把用户问题交给模型，返回一段可直接朗读的纯文本回答。"""
+    async def chat(self, messages: Sequence[ChatMessage]) -> str:
+        """把标准对话消息交给模型，返回一段可直接朗读的纯文本回答。"""
 
 
 class OllamaService(LLMService):
@@ -73,14 +76,14 @@ class OllamaService(LLMService):
         # transport 仅供测试注入 httpx.MockTransport，生产路径保持为 None。
         self._transport = transport
 
-    async def chat(self, text: str) -> str:
+    async def chat(self, messages: Sequence[ChatMessage]) -> str:
         payload = await self._request(
             "/api/chat",
             {
                 "model": self._model,
                 "messages": [
                     {"role": "system", "content": self.SYSTEM_PROMPT},
-                    {"role": "user", "content": text},
+                    *messages,
                 ],
                 "stream": False,
             },

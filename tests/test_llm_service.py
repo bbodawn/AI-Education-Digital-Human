@@ -24,6 +24,10 @@ QUESTION = "什么是 RAG？"
 ANSWER = "RAG 是检索增强生成，先检索资料再让模型作答。"
 
 
+def user_messages(text: str = QUESTION):
+    return [{"role": "user", "content": text}]
+
+
 def build_service(recorder, responses=None, raise_error=None, model=MODEL):
     """构造一个会记录请求、但不做真实网络调用的 OllamaService。"""
 
@@ -49,7 +53,7 @@ def test_chat_returns_model_answer() -> None:
     requests = []
     service = build_service(requests)
 
-    answer = asyncio.run(service.chat(QUESTION))
+    answer = asyncio.run(service.chat(user_messages()))
 
     assert answer == ANSWER
     assert requests[0].url.path == "/api/chat"
@@ -65,7 +69,7 @@ def test_chat_sends_system_prompt_and_question() -> None:
     requests = []
     service = build_service(requests)
 
-    asyncio.run(service.chat(QUESTION))
+    asyncio.run(service.chat(user_messages()))
 
     payload = json.loads(requests[0].content)
     roles = [m["role"] for m in payload["messages"]]
@@ -76,11 +80,32 @@ def test_chat_sends_system_prompt_and_question() -> None:
     assert payload["model"] == MODEL
 
 
+def test_chat_preserves_conversation_order_with_one_system_prompt() -> None:
+    requests = []
+    service = build_service(requests)
+    messages = [
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant", "content": "A1"},
+        {"role": "user", "content": "Q2"},
+    ]
+
+    asyncio.run(service.chat(messages))
+
+    payload = json.loads(requests[0].content)
+    assert payload["messages"] == [
+        {"role": "system", "content": OllamaService.SYSTEM_PROMPT},
+        *messages,
+    ]
+    assert sum(message["role"] == "system" for message in payload["messages"]) == 1
+    assert payload["stream"] is False
+    assert payload["model"] == MODEL
+
+
 def test_chat_uses_configured_model() -> None:
     requests = []
     service = build_service(requests, model="qwen2.5:0.5b")
 
-    asyncio.run(service.chat(QUESTION))
+    asyncio.run(service.chat(user_messages()))
 
     assert json.loads(requests[0].content)["model"] == "qwen2.5:0.5b"
 
@@ -92,7 +117,7 @@ def test_chat_strips_whitespace_around_answer() -> None:
         responses={"/api/chat": {"message": {"role": "assistant", "content": "  你好  \n"}}},
     )
 
-    assert asyncio.run(service.chat(QUESTION)) == "你好"
+    assert asyncio.run(service.chat(user_messages())) == "你好"
 
 
 # --------------------------------------------------------------------------
@@ -111,14 +136,14 @@ def test_empty_answer_raises_bad_response() -> None:
     )
 
     with pytest.raises(LLMBadResponse):
-        asyncio.run(service.chat(QUESTION))
+        asyncio.run(service.chat(user_messages()))
 
 
 def test_missing_message_field_raises_bad_response() -> None:
     service = build_service([], responses={"/api/chat": {"done": True}})
 
     with pytest.raises(LLMBadResponse):
-        asyncio.run(service.chat(QUESTION))
+        asyncio.run(service.chat(user_messages()))
 
 
 def test_http_error_raises_bad_response() -> None:
@@ -130,7 +155,7 @@ def test_http_error_raises_bad_response() -> None:
     )
 
     with pytest.raises(LLMBadResponse) as excinfo:
-        asyncio.run(service.chat(QUESTION))
+        asyncio.run(service.chat(user_messages()))
 
     assert excinfo.value.status_code == 500
 
@@ -140,7 +165,7 @@ def test_connection_error_raises_unavailable() -> None:
     service = build_service([], raise_error=httpx.ConnectError("connection refused"))
 
     with pytest.raises(LLMUnavailable):
-        asyncio.run(service.chat(QUESTION))
+        asyncio.run(service.chat(user_messages()))
 
 
 def test_timeout_raises_unavailable() -> None:
@@ -148,7 +173,7 @@ def test_timeout_raises_unavailable() -> None:
     service = build_service([], raise_error=httpx.ReadTimeout("timed out"))
 
     with pytest.raises(LLMUnavailable):
-        asyncio.run(service.chat(QUESTION))
+        asyncio.run(service.chat(user_messages()))
 
 
 def test_non_json_response_raises_bad_response() -> None:
@@ -160,7 +185,7 @@ def test_non_json_response_raises_bad_response() -> None:
     )
 
     with pytest.raises(LLMBadResponse):
-        asyncio.run(service.chat(QUESTION))
+        asyncio.run(service.chat(user_messages()))
 
 
 def test_requests_go_to_configured_base_url() -> None:
@@ -169,7 +194,7 @@ def test_requests_go_to_configured_base_url() -> None:
     service = build_service(requests, model=MODEL)
     service._base_url = "http://10.0.0.9:11434"
 
-    asyncio.run(service.chat(QUESTION))
+    asyncio.run(service.chat(user_messages()))
 
     assert requests[0].url.host == "10.0.0.9"
     assert requests[0].url.port == 11434

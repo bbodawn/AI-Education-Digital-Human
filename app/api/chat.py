@@ -16,11 +16,13 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from app.conversation import conversation_store
 from app.schemas import (
     ChatAskRequest,
     ChatAskResponse,
     ChatMetrics,
     ChatInterruptResponse,
+    ChatResetResponse,
     ChatSayRequest,
     ChatSayResponse,
 )
@@ -167,66 +169,89 @@ async def chat_ask(
     先解析会话再调模型——没有可播报的会话时就不该浪费一次生成。
     """
     session_id = await _resolve_session_id(service)
+    lock = conversation_store.lock_for(session_id)
 
-    # 记下开始生成时的打断计数，生成结束后比对
-    epoch = _current_interrupt_epoch()
+    async with lock:
+        messages = conversation_store.get_messages(session_id)
+        messages.append({"role": "user", "content": payload.text})
 
-    llm_started_at = time.perf_counter()
-    answer = await llm.chat(payload.text)
-    answer_ready_at = time.perf_counter()
-    llm_ms = _elapsed_ms(llm_started_at, answer_ready_at)
-    logger.info("模型回答生成完成（%d 字），sessionid=%s", len(answer), session_id)
+        # 记下开始生成时的打断计数，生成结束后比对
+        epoch = _current_interrupt_epoch()
 
-    if _current_interrupt_epoch() != epoch:
-        # 生成期间用户点了打断。这句话已经过时了，不能接着播。
-        logger.info("生成期间收到打断，跳过播报：sessionid=%s", session_id)
+        # 锁等待和历史读取不计入 llm_ms；该指标仍只覆盖实际模型调用。
+        llm_started_at = time.perf_counter()
+        answer = await llm.chat(messages)
+        answer_ready_at = time.perf_counter()
+        llm_ms = _elapsed_ms(llm_started_at, answer_ready_at)
+        logger.info("模型回答生成完成（%d 字），sessionid=%s", len(answer), session_id)
+
+        if _current_interrupt_epoch() != epoch:
+            # 生成期间用户点了打断。这句话已经过时了，不能播报或写入历史。
+            logger.info("生成期间收到打断，跳过播报：sessionid=%s", session_id)
+            return ChatAskResponse(
+                status="cancelled",
+                question=payload.text,
+                answer=answer,
+                session_id=session_id,
+                verified_speaking=False,
+                metrics=ChatMetrics(
+                    llm_ms=llm_ms,
+                    avatar_startup_ms=None,
+                    avatar_startup_status="cancelled",
+                ),
+            )
+
+        speaking_baseline = await _observe_speaking_baseline(service, session_id)
+        await service.say(session_id=session_id, text=answer, interrupt=False)
+
+        verified = await _confirm_speaking(service, session_id)
+        if not verified:
+            logger.warning(
+                "回答已受理但未观察到播报：sessionid=%s。若画面无反应，"
+                "说明选中的会话可能不是浏览器当前观看的那个。",
+                session_id,
+            )
+
+        avatar_startup_ms: int | None = None
+        if speaking_baseline is True:
+            avatar_startup_status = "already_speaking"
+        elif speaking_baseline is None:
+            avatar_startup_status = "unavailable"
+        elif verified:
+            avatar_startup_ms = _elapsed_ms(answer_ready_at, time.perf_counter())
+            avatar_startup_status = "measured"
+        else:
+            avatar_startup_status = "not_observed"
+
+        # 只有正常业务响应才提交完整 turn；异常和 cancelled 都不会走到这里。
+        conversation_store.append_turn(session_id, payload.text, answer)
+
         return ChatAskResponse(
-            status="cancelled",
+            status="accepted" if verified else "accepted_unverified",
             question=payload.text,
             answer=answer,
             session_id=session_id,
-            verified_speaking=False,
+            verified_speaking=verified,
             metrics=ChatMetrics(
                 llm_ms=llm_ms,
-                avatar_startup_ms=None,
-                avatar_startup_status="cancelled",
+                avatar_startup_ms=avatar_startup_ms,
+                avatar_startup_status=avatar_startup_status,
             ),
         )
 
-    speaking_baseline = await _observe_speaking_baseline(service, session_id)
-    await service.say(session_id=session_id, text=answer, interrupt=False)
 
-    verified = await _confirm_speaking(service, session_id)
-    if not verified:
-        logger.warning(
-            "回答已受理但未观察到播报：sessionid=%s。若画面无反应，"
-            "说明选中的会话可能不是浏览器当前观看的那个。",
-            session_id,
-        )
+@router.post("/reset", response_model=ChatResetResponse)
+async def chat_reset(
+    service: DigitalHumanService = Depends(get_service),
+) -> ChatResetResponse:
+    """清空当前会话的短期对话历史，不改变数字人或播报状态。"""
+    session_id = await _resolve_session_id(service)
+    lock = conversation_store.lock_for(session_id)
 
-    avatar_startup_ms: int | None = None
-    if speaking_baseline is True:
-        avatar_startup_status = "already_speaking"
-    elif speaking_baseline is None:
-        avatar_startup_status = "unavailable"
-    elif verified:
-        avatar_startup_ms = _elapsed_ms(answer_ready_at, time.perf_counter())
-        avatar_startup_status = "measured"
-    else:
-        avatar_startup_status = "not_observed"
+    async with lock:
+        conversation_store.clear(session_id)
 
-    return ChatAskResponse(
-        status="accepted" if verified else "accepted_unverified",
-        question=payload.text,
-        answer=answer,
-        session_id=session_id,
-        verified_speaking=verified,
-        metrics=ChatMetrics(
-            llm_ms=llm_ms,
-            avatar_startup_ms=avatar_startup_ms,
-            avatar_startup_status=avatar_startup_status,
-        ),
-    )
+    return ChatResetResponse(session_id=session_id)
 
 
 @router.post("/interrupt", response_model=ChatInterruptResponse)
