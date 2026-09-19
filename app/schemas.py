@@ -3,7 +3,9 @@
 只定义当前真正被路由使用的模型，不为将来预留。
 """
 
-from pydantic import BaseModel, Field
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
 
 
 class WebRTCOfferRequest(BaseModel):
@@ -82,6 +84,59 @@ class ChatAskResponse(BaseModel):
     session_id: str
     verified_speaking: bool
     metrics: ChatMetrics
+
+
+class TutorStartRequest(BaseModel):
+    """开始一场指定主题的引导问答。"""
+
+    topic: str
+    mode: Literal["guided_qa"] = "guided_qa"
+
+    @field_validator("topic")
+    @classmethod
+    def validate_topic(cls, value: str) -> str:
+        topic = value.strip()
+        if not topic:
+            raise ValueError("topic must not be empty")
+        return topic
+
+
+class TutorAnswerRequest(BaseModel):
+    """回答教育教练当前提出的问题。"""
+
+    text: str = Field(min_length=1)
+
+
+class TutorStartResponse(BaseModel):
+    """第一道教学问题及其数字人播报状态。"""
+
+    status: str
+    session_id: str
+    topic: str
+    question: str
+    question_index: int = Field(ge=1)
+    verified_speaking: bool
+    metrics: ChatMetrics
+
+
+class TutorAnswerResponse(BaseModel):
+    """当前回答的反馈、解释和下一道问题。"""
+
+    status: str
+    session_id: str
+    evaluation: str
+    explanation: str
+    next_question: str
+    question_index: int = Field(ge=1)
+    verified_speaking: bool
+    metrics: ChatMetrics
+
+
+class TutorResetResponse(BaseModel):
+    """当前会话的教学状态和相关短期上下文已清空。"""
+
+    status: str = "reset"
+    session_id: str
 
 
 class ASRTranscriptionResponse(BaseModel):

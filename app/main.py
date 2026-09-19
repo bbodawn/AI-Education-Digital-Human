@@ -9,7 +9,7 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 
-from app.api import asr, avatar, chat
+from app.api import asr, avatar, chat, tutor
 from app.config import STATIC_DIR
 from app.services.asr import ASRTranscriptionError, ASRUnavailable
 from app.services.digital_human import DigitalHumanBadResponse, DigitalHumanUnavailable
@@ -17,10 +17,11 @@ from app.services.llm import LLMBadResponse, LLMUnavailable
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AI 数字人教育教练", version="0.3.0")
+app = FastAPI(title="AI 数字人教育教练", version="0.5.0")
 
 app.include_router(avatar.router)
 app.include_router(chat.router)
+app.include_router(tutor.router)
 app.include_router(asr.router)
 
 

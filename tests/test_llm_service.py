@@ -101,6 +101,35 @@ def test_chat_preserves_conversation_order_with_one_system_prompt() -> None:
     assert payload["model"] == MODEL
 
 
+def test_chat_merges_instruction_into_the_only_system_message() -> None:
+    requests = []
+    service = build_service(requests)
+    messages = [
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant", "content": "A1"},
+        {"role": "user", "content": "Q2"},
+    ]
+    instruction = "学习主题：RAG\n请评价回答并提出下一题。"
+
+    asyncio.run(service.chat(messages, instruction=instruction))
+
+    payload = json.loads(requests[0].content)
+    system_messages = [
+        message for message in payload["messages"] if message["role"] == "system"
+    ]
+    assert len(system_messages) == 1
+    assert OllamaService.SYSTEM_PROMPT in system_messages[0]["content"]
+    assert instruction in system_messages[0]["content"]
+    assert payload["messages"][1:] == messages
+    assert all(
+        instruction not in message["content"]
+        for message in payload["messages"]
+        if message["role"] != "system"
+    )
+    assert payload["stream"] is False
+    assert payload["model"] == MODEL
+
+
 def test_chat_uses_configured_model() -> None:
     requests = []
     service = build_service(requests, model="qwen2.5:0.5b")

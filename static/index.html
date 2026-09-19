@@ -55,6 +55,10 @@
       .layout { grid-template-columns: 1fr; }
     }
 
+    @media (min-width: 821px) {
+      .avatar-card { position: sticky; top: 1.5rem; }
+    }
+
     .card {
       background: var(--card);
       border: 1px solid var(--border);
@@ -124,9 +128,10 @@
       margin-bottom: 6px;
     }
 
-    textarea {
+    textarea,
+    input[type="text"],
+    select {
       width: 100%;
-      min-height: 96px;
       padding: 10px 12px;
       font: inherit;
       font-size: 14px;
@@ -134,10 +139,16 @@
       background: #fbfcfd;
       border: 1px solid var(--border);
       border-radius: 8px;
+    }
+
+    textarea {
+      min-height: 96px;
       resize: vertical;
     }
 
-    textarea:focus {
+    textarea:focus,
+    input[type="text"]:focus,
+    select:focus {
       outline: none;
       border-color: var(--accent);
       background: #fff;
@@ -151,6 +162,26 @@
       margin-top: 12px;
     }
 
+    .mode-row {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+
+    .mode-row .field-label { margin: 0; }
+
+    .tutor-controls {
+      margin-bottom: 12px;
+      padding: 12px;
+      background: #f8fafc;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+
+    .tutor-controls .actions { margin-top: 8px; }
+
     button {
       font: inherit;
       font-size: 14px;
@@ -161,12 +192,14 @@
       cursor: pointer;
     }
 
-    #sendButton {
+    #askButton,
+    #tutorStartButton {
       background: var(--accent);
       color: #fff;
     }
 
-    #sendButton:hover { background: #1d4ed8; }
+    #askButton:hover,
+    #tutorStartButton:hover { background: #1d4ed8; }
 
     #recordButton,
     #resetButton,
@@ -221,6 +254,18 @@
       line-height: 1.7;
       color: var(--text);
       white-space: pre-wrap;
+    }
+
+    .answer-text[data-mode="tutor"] {
+      max-height: clamp(14rem, 45dvh, 34rem);
+      overflow-y: auto;
+      overscroll-behavior: contain;
+    }
+
+    .tutor-turn + .tutor-turn {
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid #cfdefb;
     }
 
     .metrics {
@@ -296,12 +341,12 @@
   <div class="page">
     <header>
       <h1>AI 数字人教育教练</h1>
-      <p>本地业务控制端 · V0.1</p>
+      <p>本地业务控制端 · V0.5</p>
     </header>
 
     <div class="layout">
       <!-- 左：数字人画面（MediaMTX 自带播放页，经 SSH 隧道到 AutoDL） -->
-      <section class="card">
+      <section class="card avatar-card">
         <h2>数字人画面</h2>
 
         <div class="status" id="statusBadge" data-tone="idle">
@@ -321,9 +366,25 @@
 
       <!-- 右：控制台 -->
       <section class="card">
-        <h2>你想问什么？</h2>
+        <h2 id="controlTitle">你想问什么？</h2>
 
-        <label class="field-label" for="messageInput">输入问题，由本地 Qwen 生成回答</label>
+        <div class="mode-row">
+          <label class="field-label" for="modeSelect">模式</label>
+          <select id="modeSelect">
+            <option value="chat" selected>普通聊天</option>
+            <option value="tutor">教学模式</option>
+          </select>
+        </div>
+
+        <div class="tutor-controls" id="tutorControls" hidden>
+          <label class="field-label" for="tutorTopicInput">学习主题</label>
+          <input id="tutorTopicInput" type="text" placeholder="例如：RAG 基础">
+          <div class="actions">
+            <button id="tutorStartButton" type="button">开始学习</button>
+          </div>
+        </div>
+
+        <label class="field-label" id="messageInputLabel" for="messageInput">输入问题，由本地 Qwen 生成回答</label>
         <textarea id="messageInput" placeholder="什么是 RAG？"></textarea>
 
         <div class="actions">
@@ -336,7 +397,7 @@
         <p class="hint" id="hint" role="status" aria-live="polite"></p>
 
         <div class="answer" id="answerBox" hidden>
-          <div class="answer-label">数字人回答</div>
+          <div class="answer-label" id="answerLabel">数字人回答</div>
           <div class="answer-text" id="answerText"></div>
         </div>
 
@@ -360,6 +421,9 @@
         <li><span class="method">POST</span><code>/api/v1/chat/reset</code></li>
         <li><span class="method">POST</span><code>/api/v1/chat/say</code></li>
         <li><span class="method">POST</span><code>/api/v1/chat/interrupt</code></li>
+        <li><span class="method">POST</span><code>/api/v1/tutor/start</code></li>
+        <li><span class="method">POST</span><code>/api/v1/tutor/answer</code></li>
+        <li><span class="method">POST</span><code>/api/v1/tutor/reset</code></li>
         <li><span class="method">POST</span><code>/api/v1/asr/transcribe</code></li>
       </ul>
       <p class="note">
@@ -379,8 +443,16 @@
     const API = {
       ask:       { path: "/api/v1/chat/ask" },
       reset:     { path: "/api/v1/chat/reset" },
+      tutorStart:  { path: "/api/v1/tutor/start" },
+      tutorAnswer: { path: "/api/v1/tutor/answer" },
+      tutorReset:  { path: "/api/v1/tutor/reset" },
       interrupt: { path: "/api/v1/chat/interrupt" },
       asr:       { path: "/api/v1/asr/transcribe" }
+    };
+
+    const MODE = {
+      CHAT:  "chat",
+      TUTOR: "tutor"
     };
 
     const RECORDING_STATE = {
@@ -409,6 +481,12 @@
 
     const statusBadge   = document.getElementById("statusBadge");
     const statusText    = document.getElementById("statusText");
+    const controlTitle  = document.getElementById("controlTitle");
+    const modeSelect    = document.getElementById("modeSelect");
+    const tutorControls = document.getElementById("tutorControls");
+    const tutorTopicInput = document.getElementById("tutorTopicInput");
+    const tutorStartButton = document.getElementById("tutorStartButton");
+    const messageInputLabel = document.getElementById("messageInputLabel");
     const inputEl       = document.getElementById("messageInput");
     const recordButton  = document.getElementById("recordButton");
     const askButton     = document.getElementById("askButton");
@@ -416,6 +494,7 @@
     const stopButton    = document.getElementById("interruptButton");
     const hintEl        = document.getElementById("hint");
     const answerBox     = document.getElementById("answerBox");
+    const answerLabel   = document.getElementById("answerLabel");
     const answerText    = document.getElementById("answerText");
     const metricsBox    = document.getElementById("responseMetrics");
     const asrLatencyEl  = document.getElementById("asrLatency");
@@ -431,6 +510,13 @@
     let recordingError = null;
     let chatRequestInFlight = false;
     let conversationResetInFlight = false;
+    let tutorStartInFlight = false;
+    let modeSwitchInFlight = false;
+    let currentMode = MODE.CHAT;
+    let tutorSessionStarted = false;
+    let currentTutorQuestion = "";
+    let currentTutorQuestionIndex = 0;
+    let tutorPendingTurn = null;
     let recordingStoppedAt = null;
 
     function setStatus(key, detail) {
@@ -457,6 +543,44 @@
       totalLatencyEl.textContent = "—";
     }
 
+    function interactionBusy() {
+      return chatRequestInFlight || conversationResetInFlight ||
+        tutorStartInFlight || modeSwitchInFlight;
+    }
+
+    function clearLatestTurnUI() {
+      inputEl.value = "";
+      answerText.textContent = "";
+      answerText.scrollTop = 0;
+      tutorPendingTurn = null;
+      answerBox.hidden = true;
+      resetMetrics();
+    }
+
+    function appendTutorPendingQuestion(questionIndex, question) {
+      const turn = document.createElement("div");
+      turn.className = "tutor-turn";
+      turn.textContent = "第 " + questionIndex + " 题\n本题：" + question + "\n等待回答……";
+      answerText.appendChild(turn);
+      tutorPendingTurn = turn;
+      answerText.scrollTop = answerText.scrollHeight;
+      return turn;
+    }
+
+    function updateModeUI() {
+      const tutorMode = currentMode === MODE.TUTOR;
+      modeSelect.value = currentMode;
+      tutorControls.hidden = !tutorMode;
+      answerText.dataset.mode = currentMode;
+      controlTitle.textContent = tutorMode ? "教育教练" : "你想问什么？";
+      messageInputLabel.textContent = tutorMode
+        ? "回答当前教学问题（请先开始学习）"
+        : "输入问题，由本地 Qwen 生成回答";
+      inputEl.placeholder = tutorMode ? "输入你对当前问题的回答" : "什么是 RAG？";
+      askButton.textContent = tutorMode ? "提交回答" : "让数字人回答";
+      answerLabel.textContent = tutorMode ? "教学问题" : "数字人回答";
+    }
+
     function renderMetrics(data, asrMs, totalStartedAt, totalFinishedAt) {
       const metrics = data.metrics || {};
       const avatarMeasured = metrics.avatar_startup_status === "measured" &&
@@ -477,14 +601,18 @@
 
     function setRecordingState(nextState) {
       recordingState = nextState;
-      const interactionBusy = chatRequestInFlight || conversationResetInFlight;
+      const busy = interactionBusy();
+      const tutorNeedsStart = currentMode === MODE.TUTOR && !tutorSessionStarted;
       recordButton.dataset.state = nextState;
       recordButton.disabled = nextState === RECORDING_STATE.REQUESTING ||
         nextState === RECORDING_STATE.TRANSCRIBING ||
         nextState === RECORDING_STATE.ASKING ||
-        interactionBusy;
-      askButton.disabled = nextState !== RECORDING_STATE.IDLE || interactionBusy;
-      resetButton.disabled = nextState !== RECORDING_STATE.IDLE || interactionBusy;
+        busy || tutorNeedsStart;
+      askButton.disabled = nextState !== RECORDING_STATE.IDLE || busy || tutorNeedsStart;
+      resetButton.disabled = nextState !== RECORDING_STATE.IDLE || busy;
+      modeSelect.disabled = nextState !== RECORDING_STATE.IDLE || busy;
+      tutorTopicInput.disabled = nextState !== RECORDING_STATE.IDLE || busy;
+      tutorStartButton.disabled = nextState !== RECORDING_STATE.IDLE || busy;
 
       if (nextState === RECORDING_STATE.REQUESTING) {
         recordButton.textContent = "正在请求权限...";
@@ -543,7 +671,12 @@
     }
 
     async function startRecording() {
-      if (recordingState !== RECORDING_STATE.IDLE || chatRequestInFlight) return;
+      if (recordingState !== RECORDING_STATE.IDLE || interactionBusy()) return;
+      if (currentMode === MODE.TUTOR && !tutorSessionStarted) {
+        setHint("请先输入学习主题并开始学习", "error");
+        tutorTopicInput.focus();
+        return;
+      }
 
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         setHint("当前浏览器或访问方式不支持麦克风，请使用支持 HTTPS/localhost 的现代浏览器", "error");
@@ -687,17 +820,89 @@
       return data;
     }
 
+    async function startTutorSession() {
+      if (recordingState !== RECORDING_STATE.IDLE || interactionBusy()) return;
+
+      const topic = tutorTopicInput.value.trim();
+      if (!topic) {
+        setHint("请先输入学习主题", "error");
+        tutorTopicInput.focus();
+        return;
+      }
+
+      tutorStartInFlight = true;
+      tutorSessionStarted = false;
+      currentTutorQuestion = "";
+      currentTutorQuestionIndex = 0;
+      tutorPendingTurn = null;
+      setRecordingState(RECORDING_STATE.ASKING);
+      answerBox.hidden = true;
+      answerText.textContent = "";
+      answerText.scrollTop = 0;
+      resetMetrics();
+      setStatus("THINKING");
+      setHint("教育教练正在准备第一道题...");
+      const totalStartedAt = performance.now();
+
+      try {
+        const data = await postJson(API.tutorStart.path, {
+          topic: topic,
+          mode: "guided_qa"
+        });
+        const totalFinishedAt = performance.now();
+
+        answerLabel.textContent = "教学记录";
+        answerBox.hidden = false;
+        renderMetrics(data, null, totalStartedAt, totalFinishedAt);
+
+        if (data.status === "cancelled") {
+          answerText.textContent = data.question;
+          setStatus("INTERRUPTED");
+          setHint("第一道题生成期间被打断，请重新开始学习", "error");
+        } else {
+          tutorSessionStarted = true;
+          currentTutorQuestion = data.question;
+          currentTutorQuestionIndex = data.question_index;
+          appendTutorPendingQuestion(data.question_index, data.question);
+          inputEl.value = "";
+          messageInputLabel.textContent = "回答当前教学问题";
+          setStatus("SPEAKING", data.verified_speaking ? "" : "未确认");
+          setHint(data.verified_speaking
+            ? "第一道题已开始播报，请输入或说出你的回答"
+            : "第一道题已受理，但未确认数字人起播", data.verified_speaking ? "" : "error");
+          inputEl.focus();
+        }
+      } catch (error) {
+        resetMetrics();
+        setStatus("ERROR", error.message);
+        setHint("开始学习失败：" + error.message, "error");
+      } finally {
+        tutorStartInFlight = false;
+        setRecordingState(RECORDING_STATE.IDLE);
+      }
+    }
+
     async function askQuestion(context) {
-      if (chatRequestInFlight) return;
+      if (interactionBusy()) return;
       if (recordingState !== RECORDING_STATE.IDLE &&
           recordingState !== RECORDING_STATE.ASKING) return;
 
+      const tutorMode = currentMode === MODE.TUTOR;
+      if (tutorMode && !tutorSessionStarted) {
+        setHint("请先输入学习主题并开始学习", "error");
+        tutorTopicInput.focus();
+        return;
+      }
+
       const text = inputEl.value.trim();
       if (!text) {
-        setHint("请先输入问题", "error");
+        setHint(tutorMode ? "请先输入对当前问题的回答" : "请先输入问题", "error");
         inputEl.focus();
         return;
       }
+
+      const answeredTutorQuestion = tutorMode ? currentTutorQuestion : "";
+      const answeredTutorQuestionIndex = tutorMode ? currentTutorQuestionIndex : 0;
 
       const fromVoice = context && context.source === "voice";
       if (!fromVoice) resetMetrics();
@@ -708,19 +913,37 @@
 
       chatRequestInFlight = true;
       setRecordingState(RECORDING_STATE.ASKING);
-      answerBox.hidden = true;
+      if (!tutorMode) answerBox.hidden = true;
       setStatus("THINKING");
-      setHint("Qwen 正在生成回答…（首次调用需要几秒）");
+      setHint(tutorMode
+        ? "教育教练正在评价回答并准备下一题..."
+        : "Qwen 正在生成回答…（首次调用需要几秒）");
 
       try {
-        const data = await postJson(API.ask.path, { text: text });
+        const endpoint = tutorMode ? API.tutorAnswer.path : API.ask.path;
+        const data = await postJson(endpoint, { text: text });
         const totalFinishedAt = performance.now();
 
-        // 无论播不播，都先把模型生成的内容显示出来——
-        // 这样用户能对照「AI 想说什么」和「数字人说了什么」。
-        answerText.textContent = data.answer;
+        // Tutor 仅在本轮成功提交后更新教学时间线；普通聊天保持原展示方式。
+        if (tutorMode) {
+          if (data.status !== "cancelled") {
+            const completedTurn = tutorPendingTurn ||
+              appendTutorPendingQuestion(answeredTutorQuestionIndex, answeredTutorQuestion);
+            completedTurn.textContent = "第 " + answeredTutorQuestionIndex + " 题\n" +
+              "本题：" + answeredTutorQuestion + "\n" +
+              "我的回答：" + text + "\n" +
+              "评价：" + data.evaluation + "\n" +
+              "解释：" + data.explanation;
+            currentTutorQuestion = data.next_question;
+            currentTutorQuestionIndex = data.question_index;
+            appendTutorPendingQuestion(data.question_index, data.next_question);
+          }
+        } else {
+          answerLabel.textContent = "数字人回答";
+          answerText.textContent = data.answer;
+        }
         answerBox.hidden = false;
-        inputEl.value = "";
+        if (!tutorMode || data.status !== "cancelled") inputEl.value = "";
         renderMetrics(data, asrMs, totalStartedAt, totalFinishedAt);
 
         if (data.status === "cancelled") {
@@ -743,6 +966,53 @@
       }
     }
 
+    async function switchMode(requestedMode) {
+      if (requestedMode === currentMode) return;
+      if (recordingState !== RECORDING_STATE.IDLE || interactionBusy()) {
+        modeSelect.value = currentMode;
+        return;
+      }
+
+      if (requestedMode === MODE.TUTOR) {
+        currentMode = MODE.TUTOR;
+        tutorSessionStarted = false;
+        currentTutorQuestion = "";
+        currentTutorQuestionIndex = 0;
+        tutorPendingTurn = null;
+        updateModeUI();
+        setRecordingState(RECORDING_STATE.IDLE);
+        setHint("输入学习主题后点击「开始学习」");
+        tutorTopicInput.focus();
+        return;
+      }
+
+      // 退出教学模式必须先清掉后端 Tutor/Conversation 状态；失败时留在 Tutor。
+      modeSwitchInFlight = true;
+      modeSelect.value = currentMode;
+      setRecordingState(RECORDING_STATE.IDLE);
+      setHint("正在退出教学模式...");
+      try {
+        await postJson(API.tutorReset.path);
+        currentMode = MODE.CHAT;
+        tutorSessionStarted = false;
+        currentTutorQuestion = "";
+        currentTutorQuestionIndex = 0;
+        tutorTopicInput.value = "";
+        clearLatestTurnUI();
+        updateModeUI();
+        setStatus("READY");
+        setHint("已切换到普通聊天");
+        inputEl.focus();
+      } catch (error) {
+        modeSelect.value = MODE.TUTOR;
+        setStatus("ERROR", error.message);
+        setHint("退出教学模式失败：" + error.message, "error");
+      } finally {
+        modeSwitchInFlight = false;
+        setRecordingState(RECORDING_STATE.IDLE);
+      }
+    }
+
     async function interrupt() {
       stopButton.disabled = true;
       try {
@@ -758,25 +1028,29 @@
     }
 
     async function startNewConversation() {
-      if (chatRequestInFlight || conversationResetInFlight ||
-          recordingState !== RECORDING_STATE.IDLE) return;
+      if (interactionBusy() || recordingState !== RECORDING_STATE.IDLE) return;
 
       conversationResetInFlight = true;
       setRecordingState(RECORDING_STATE.IDLE);
-      setHint("正在开始新对话...");
+      const tutorMode = currentMode === MODE.TUTOR;
+      setHint(tutorMode ? "正在重置教学上下文..." : "正在开始新对话...");
 
       try {
-        await postJson(API.reset.path);
-        inputEl.value = "";
-        answerText.textContent = "";
-        answerBox.hidden = true;
-        resetMetrics();
+        const resetEndpoint = tutorMode ? API.tutorReset.path : API.reset.path;
+        await postJson(resetEndpoint);
+        if (tutorMode) {
+          tutorSessionStarted = false;
+          currentTutorQuestion = "";
+          currentTutorQuestionIndex = 0;
+        }
+        clearLatestTurnUI();
+        updateModeUI();
         setStatus("READY");
-        setHint("已开始新对话");
-        inputEl.focus();
+        setHint(tutorMode ? "教学上下文已清空，可输入主题重新开始" : "已开始新对话");
+        (tutorMode ? tutorTopicInput : inputEl).focus();
       } catch (error) {
         setStatus("ERROR", error.message);
-        setHint("新对话失败：" + error.message, "error");
+        setHint((tutorMode ? "重置教学失败：" : "新对话失败：") + error.message, "error");
       } finally {
         conversationResetInFlight = false;
         setRecordingState(RECORDING_STATE.IDLE);
@@ -784,12 +1058,17 @@
     }
 
     function init() {
+      updateModeUI();
       setStatus("READY");
       setHint("输入问题后点击「让数字人回答」");
 
       recordButton.addEventListener("click", toggleRecording);
       askButton.addEventListener("click", askQuestion);
       resetButton.addEventListener("click", startNewConversation);
+      tutorStartButton.addEventListener("click", startTutorSession);
+      modeSelect.addEventListener("change", function () {
+        void switchMode(modeSelect.value);
+      });
       stopButton.addEventListener("click", interrupt);
 
       window.addEventListener("beforeunload", releaseMicrophone);

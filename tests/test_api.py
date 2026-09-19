@@ -11,6 +11,8 @@
 
 import asyncio
 import json
+import shutil
+import subprocess
 from collections.abc import Sequence
 
 import httpx
@@ -44,8 +46,15 @@ class StubLLM(LLMService):
         self.error = error
         self.on_chat = on_chat
         self.calls: list[list[ChatMessage]] = []
+        self.instructions: list[str | None] = []
 
-    async def chat(self, messages: Sequence[ChatMessage]) -> str:
+    async def chat(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        instruction: str | None = None,
+    ) -> str:
+        self.instructions.append(instruction)
         self.calls.append(
             [
                 {"role": message["role"], "content": message["content"]}
@@ -67,7 +76,12 @@ class SequencedLLM(LLMService):
         self.on_call = on_call
         self.calls: list[list[ChatMessage]] = []
 
-    async def chat(self, messages: Sequence[ChatMessage]) -> str:
+    async def chat(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        instruction: str | None = None,
+    ) -> str:
         self.calls.append(
             [
                 {"role": message["role"], "content": message["content"]}
@@ -188,9 +202,10 @@ def test_homepage_exposes_new_conversation_reset_controls() -> None:
     assert response.status_code == 200
     assert 'id="resetButton"' in response.text
     assert 'reset:     { path: "/api/v1/chat/reset" }' in response.text
-    assert "await postJson(API.reset.path);" in response.text
-    assert "resetButton.disabled = nextState !== RECORDING_STATE.IDLE || interactionBusy;" in response.text
-    assert 'setHint("已开始新对话");' in response.text
+    assert "const resetEndpoint = tutorMode ? API.tutorReset.path : API.reset.path;" in response.text
+    assert "await postJson(resetEndpoint);" in response.text
+    assert "resetButton.disabled = nextState !== RECORDING_STATE.IDLE || busy;" in response.text
+    assert '"已开始新对话"' in response.text
 
 
 def test_start_recording_preserves_existing_conversation_ui() -> None:
@@ -206,6 +221,321 @@ def test_start_recording_preserves_existing_conversation_ui() -> None:
     assert "answerText.textContent" not in start_recording
     assert "inputEl.value" not in start_recording
     assert "API.reset.path" not in start_recording
+
+
+def test_homepage_exposes_chat_and_tutor_modes_with_chat_default() -> None:
+    client = build_client(recording_handler([]))
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert 'id="modeSelect"' in response.text
+    assert '<option value="chat" selected>普通聊天</option>' in response.text
+    assert '<option value="tutor">教学模式</option>' in response.text
+    assert 'let currentMode = MODE.CHAT;' in response.text
+    assert 'id="tutorControls" hidden' in response.text
+    assert 'id="tutorTopicInput"' in response.text
+    assert 'id="tutorStartButton"' in response.text
+
+
+def test_homepage_declares_tutor_api_endpoints_without_changing_chat_endpoints() -> None:
+    client = build_client(recording_handler([]))
+
+    page = client.get("/").text
+
+    assert 'ask:       { path: "/api/v1/chat/ask" }' in page
+    assert 'reset:     { path: "/api/v1/chat/reset" }' in page
+    assert 'tutorStart:  { path: "/api/v1/tutor/start" }' in page
+    assert 'tutorAnswer: { path: "/api/v1/tutor/answer" }' in page
+    assert 'tutorReset:  { path: "/api/v1/tutor/reset" }' in page
+    assert 'interrupt: { path: "/api/v1/chat/interrupt" }' in page
+
+
+def test_tutor_start_validates_topic_and_renders_first_question() -> None:
+    client = build_client(recording_handler([]))
+    page = client.get("/").text
+    start_tutor = page.split(
+        "async function startTutorSession()", 1
+    )[1].split("async function askQuestion", 1)[0]
+
+    assert 'if (!topic)' in start_tutor
+    assert 'await postJson(API.tutorStart.path' in start_tutor
+    assert 'mode: "guided_qa"' in start_tutor
+    assert 'appendTutorPendingQuestion(data.question_index, data.question);' in start_tutor
+    assert 'renderMetrics(data, null, totalStartedAt, totalFinishedAt);' in start_tutor
+    assert 'tutorSessionStarted = true;' in start_tutor
+
+
+def test_shared_question_flow_routes_chat_and_tutor_responses() -> None:
+    client = build_client(recording_handler([]))
+    page = client.get("/").text
+    ask_question = page.split(
+        "async function askQuestion(context)", 1
+    )[1].split("async function switchMode", 1)[0]
+
+    assert 'const tutorMode = currentMode === MODE.TUTOR;' in ask_question
+    assert 'const endpoint = tutorMode ? API.tutorAnswer.path : API.ask.path;' in ask_question
+    assert 'const data = await postJson(endpoint, { text: text });' in ask_question
+    assert 'const answeredTutorQuestion = tutorMode ? currentTutorQuestion : "";' in ask_question
+    assert 'const answeredTutorQuestionIndex = tutorMode ? currentTutorQuestionIndex : 0;' in ask_question
+    assert 'if (!tutorMode) answerBox.hidden = true;' in ask_question
+    assert 'if (data.status !== "cancelled") {' in ask_question
+    assert 'completedTurn.textContent = "第 " + answeredTutorQuestionIndex' in ask_question
+    assert '"本题：" + answeredTutorQuestion' in ask_question
+    assert '"我的回答：" + text' in ask_question
+    assert '"评价：" + data.evaluation' in ask_question
+    assert '"解释：" + data.explanation' in ask_question
+    assert 'appendTutorPendingQuestion(data.question_index, data.next_question);' in ask_question
+    assert 'answerText.textContent = data.answer;' in ask_question
+
+
+def test_tutor_timeline_appends_questions_without_replacing_completed_turns() -> None:
+    client = build_client(recording_handler([]))
+    page = client.get("/").text
+    append_question = page.split(
+        "function appendTutorPendingQuestion(questionIndex, question)", 1
+    )[1].split("function updateModeUI()", 1)[0]
+    ask_question = page.split(
+        "async function askQuestion(context)", 1
+    )[1].split("async function switchMode", 1)[0]
+    tutor_render = ask_question.split("if (tutorMode) {", 1)[1].split("} else {", 1)[0]
+
+    assert 'turn.textContent = "第 " + questionIndex + " 题' in append_question
+    assert '"\\n等待回答……"' in append_question
+    assert "answerText.appendChild(turn);" in append_question
+    assert "answerText.scrollTop = answerText.scrollHeight;" in append_question
+    assert "window.scroll" not in append_question
+    assert "completedTurn.textContent" in tutor_render
+    assert "appendTutorPendingQuestion(data.question_index, data.next_question);" in tutor_render
+    assert "answerText.textContent =" not in tutor_render
+
+
+def test_tutor_timeline_scrolls_inside_two_column_classroom() -> None:
+    client = build_client(recording_handler([]))
+    page = client.get("/").text
+
+    assert '<section class="card avatar-card">' in page
+    assert '<iframe id="avatarFrame" src="http://localhost:8889/avatar/" allow="autoplay"></iframe>' in page
+    assert ".avatar-card { position: sticky; top: 1.5rem; }" in page
+    assert "position: fixed" not in page
+    assert '.answer-text[data-mode="tutor"] {' in page
+    assert "max-height: clamp(14rem, 45dvh, 34rem);" in page
+    assert "overflow-y: auto;" in page
+    assert "overscroll-behavior: contain;" in page
+    assert "answerText.dataset.mode = currentMode;" in page
+
+
+def test_tutor_timeline_clears_on_new_conversation_and_exit() -> None:
+    client = build_client(recording_handler([]))
+    page = client.get("/").text
+    clear_ui = page.split("function clearLatestTurnUI()", 1)[1].split(
+        "function appendTutorPendingQuestion", 1
+    )[0]
+    switch_mode = page.split("async function switchMode(requestedMode)", 1)[1].split(
+        "async function interrupt()", 1
+    )[0]
+    new_conversation = page.split("async function startNewConversation()", 1)[1].split(
+        "function init()", 1
+    )[0]
+
+    assert 'answerText.textContent = "";' in clear_ui
+    assert "tutorPendingTurn = null;" in clear_ui
+    assert "await postJson(API.tutorReset.path);" in switch_mode
+    assert "clearLatestTurnUI();" in switch_mode
+    assert "await postJson(resetEndpoint);" in new_conversation
+    assert "clearLatestTurnUI();" in new_conversation
+
+
+def test_tutor_timeline_retains_three_turns_and_resets_in_actual_javascript() -> None:
+    """执行页面内联 JS，防止静态断言漏掉整块覆盖旧轮次的回归。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the frontend behavior check")
+
+    client = build_client(recording_handler([]))
+    page = client.get("/").text
+    script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const assert = require("assert");
+const html = fs.readFileSync(0, "utf8");
+const inline = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)][0][1];
+class Element {
+  constructor() {
+    this._text = ""; this.children = []; this.hidden = false;
+    this.disabled = false; this.dataset = {}; this.value = "";
+    this._scrollTop = 0; this.scrollWrites = [];
+  }
+  set textContent(value) { this._text = String(value); this.children = []; }
+  get textContent() { return this._text + this.children.map(child => child.textContent).join(""); }
+  appendChild(child) { this.children.push(child); return child; }
+  get scrollHeight() { return this.children.length * 100; }
+  set scrollTop(value) { this._scrollTop = value; this.scrollWrites.push(value); }
+  get scrollTop() { return this._scrollTop; }
+  addEventListener() {}
+  focus() {}
+}
+const elements = new Map();
+const document = {
+  getElementById(id) {
+    if (!elements.has(id)) elements.set(id, new Element());
+    return elements.get(id);
+  },
+  createElement() { return new Element(); }
+};
+const replies = [];
+const paths = [];
+const sandbox = {
+  document, window: {
+    addEventListener() {},
+    scroll() { throw new Error("window scroll must not be used"); },
+    scrollTo() { throw new Error("window scroll must not be used"); }
+  }, navigator: {},
+  performance: { now: (() => { let value = 0; return () => ++value; })() },
+  fetch: async path => {
+    paths.push(path);
+    const data = replies.shift();
+    if (!data) throw new Error("missing response for " + path);
+    if (data instanceof Error) throw data;
+    return { ok: true, json: async () => data };
+  }
+};
+vm.createContext(sandbox);
+vm.runInContext(inline, sandbox);
+const el = id => document.getElementById(id);
+const metrics = { llm_ms: 100, avatar_startup_ms: 200, avatar_startup_status: "measured" };
+const start = question => ({
+  status: "accepted", session_id: "session-1234", question,
+  question_index: 1, verified_speaking: true, metrics
+});
+const answer = (nextQuestion, index, status="accepted") => ({
+  status, session_id: "session-1234", question_index: index,
+  evaluation: "评价" + (index - 1), explanation: "解释" + (index - 1),
+  next_question: nextQuestion, verified_speaking: status !== "cancelled", metrics
+});
+(async () => {
+  await sandbox.switchMode("tutor");
+  el("tutorTopicInput").value = "RAG 基础";
+  replies.push(start("RAG 问题1"));
+  await sandbox.startTutorSession();
+  assert.equal(el("answerText").children.length, 1);
+  assert(el("answerText").children[0].textContent.includes("RAG 问题1"));
+  assert.equal(el("answerText").dataset.mode, "tutor");
+  assert.equal(el("answerText").scrollTop, el("answerText").scrollHeight);
+
+  let firstTurn;
+  for (let index = 1; index <= 3; index++) {
+    const previousScrollWrites = el("answerText").scrollWrites.length;
+    el("messageInput").value = "回答" + index;
+    replies.push(answer("RAG 问题" + (index + 1), index + 1));
+    await sandbox.askQuestion();
+    const turns = el("answerText").children;
+    assert.equal(turns.length, index + 1);
+    if (index === 1) firstTurn = turns[0];
+    assert.strictEqual(turns[0], firstTurn);
+    for (let old = 1; old <= index; old++) {
+      const text = turns[old - 1].textContent;
+      for (const part of ["RAG 问题" + old, "回答" + old, "评价" + old, "解释" + old]) {
+        assert(text.includes(part), "lost turn " + old + ": " + part);
+      }
+    }
+    assert(turns[index].textContent.includes("RAG 问题" + (index + 1)));
+    assert(turns[index].textContent.includes("等待回答"));
+    assert.equal(el("answerText").scrollWrites.length, previousScrollWrites + 1);
+    assert.equal(el("answerText").scrollTop, el("answerText").scrollHeight);
+  }
+  assert.equal(paths.filter(path => path === "/api/v1/tutor/answer").length, 3);
+
+  el("messageInput").value = "失败后仍可重试";
+  const previousScrollWrites = el("answerText").scrollWrites.length;
+  replies.push(new Error("mock failure"));
+  await sandbox.askQuestion();
+  assert.equal(el("answerText").children.length, 4);
+  assert.equal(el("answerText").scrollWrites.length, previousScrollWrites);
+  assert.equal(el("messageInput").value, "失败后仍可重试");
+  replies.push(answer("不应推进的问题", 5, "cancelled"));
+  await sandbox.askQuestion();
+  assert.equal(el("answerText").children.length, 4);
+  assert.equal(el("answerText").scrollWrites.length, previousScrollWrites);
+  assert(el("answerText").children[3].textContent.includes("RAG 问题4"));
+  el("messageInput").value = "回答4";
+  replies.push(answer("RAG 问题5", 5));
+  await sandbox.askQuestion();
+  assert.equal(el("answerText").children.length, 5);
+  assert(el("answerText").children[3].textContent.includes("RAG 问题4"));
+  assert(el("answerText").children[3].textContent.includes("回答4"));
+
+  replies.push({ status: "reset", session_id: "session-1234" });
+  await sandbox.startNewConversation();
+  assert.equal(el("answerText").children.length, 0);
+  assert.equal(el("answerText").scrollTop, 0);
+  el("tutorTopicInput").value = "Python 基础";
+  replies.push(start("Python 问题1"));
+  await sandbox.startTutorSession();
+  assert.equal(el("answerText").children.length, 1);
+  assert(!el("answerText").textContent.includes("RAG 问题"));
+
+  replies.push({ status: "reset", session_id: "session-1234" });
+  await sandbox.switchMode("chat");
+  assert.equal(el("answerText").children.length, 0);
+  assert.equal(el("answerText").dataset.mode, "chat");
+  el("messageInput").value = "普通聊天";
+  replies.push({ status: "accepted", session_id: "session-1234",
+    answer: "普通回答", verified_speaking: true, metrics });
+  await sandbox.askQuestion();
+  assert.equal(el("answerText").textContent, "普通回答");
+  assert.equal(el("answerText").children.length, 0);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    result = subprocess.run(
+        [node, "-e", script], input=page, text=True, encoding="utf-8",
+        capture_output=True, timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_asr_auto_submission_reuses_mode_aware_question_flow() -> None:
+    client = build_client(recording_handler([]))
+    page = client.get("/").text
+    transcribe = page.split(
+        "async function transcribeRecording(recorder)", 1
+    )[1].split("function toggleRecording()", 1)[0]
+
+    assert 'inputEl.value = data.text.trim();' in transcribe
+    assert 'await askQuestion({ source: "voice"' in transcribe
+    assert "API.tutorAnswer" not in transcribe
+    assert "API.ask.path" not in transcribe
+
+
+def test_mode_switch_only_resets_when_exiting_tutor() -> None:
+    client = build_client(recording_handler([]))
+    page = client.get("/").text
+    switch_mode = page.split(
+        "async function switchMode(requestedMode)", 1
+    )[1].split("async function interrupt()", 1)[0]
+    enter_tutor, exit_tutor = switch_mode.split(
+        "// 退出教学模式必须先清掉后端 Tutor/Conversation 状态", 1
+    )
+
+    assert "postJson" not in enter_tutor
+    assert "currentMode = MODE.TUTOR;" in enter_tutor
+    assert "await postJson(API.tutorReset.path);" in exit_tutor
+    assert "currentMode = MODE.CHAT;" in exit_tutor
+    assert "modeSelect.value = MODE.TUTOR;" in exit_tutor
+
+
+def test_tutor_busy_controls_and_reset_routing_are_present() -> None:
+    client = build_client(recording_handler([]))
+    page = client.get("/").text
+
+    assert "tutorStartInFlight || modeSwitchInFlight" in page
+    assert "modeSelect.disabled = nextState !== RECORDING_STATE.IDLE || busy;" in page
+    assert "tutorStartButton.disabled = nextState !== RECORDING_STATE.IDLE || busy;" in page
+    assert "const resetEndpoint = tutorMode ? API.tutorReset.path : API.reset.path;" in page
+    assert "if (tutorMode) {" in page
+    assert "tutorSessionStarted = false;" in page
+    assert 'currentTutorQuestion = "";' in page
+    assert "clearLatestTurnUI();" in page
 
 
 # --------------------------------------------------------------------------
@@ -491,6 +821,7 @@ def test_ask_generates_answer_then_speaks_it() -> None:
     assert body["metrics"]["avatar_startup_status"] == "measured"
 
     assert llm.calls == [[{"role": "user", "content": QUESTION}]]
+    assert llm.instructions == [None]
     human = next(r for r in requests if r.url.path == "/human")
     payload = json.loads(human.content)
     assert payload["text"] == MODEL_ANSWER
@@ -774,7 +1105,12 @@ def test_ask_serializes_concurrent_requests_for_same_session() -> None:
             self.first_started = asyncio.Event()
             self.release_first = asyncio.Event()
 
-        async def chat(self, messages: Sequence[ChatMessage]) -> str:
+        async def chat(
+            self,
+            messages: Sequence[ChatMessage],
+            *,
+            instruction: str | None = None,
+        ) -> str:
             self.calls.append(
                 [
                     {"role": message["role"], "content": message["content"]}
@@ -853,7 +1189,12 @@ def test_reset_waits_for_in_flight_ask_then_clears_committed_turn() -> None:
             self.started = asyncio.Event()
             self.release = asyncio.Event()
 
-        async def chat(self, messages: Sequence[ChatMessage]) -> str:
+        async def chat(
+            self,
+            messages: Sequence[ChatMessage],
+            *,
+            instruction: str | None = None,
+        ) -> str:
             assert messages == [{"role": "user", "content": "Q1"}]
             self.started.set()
             await self.release.wait()
